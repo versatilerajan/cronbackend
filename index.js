@@ -1831,6 +1831,155 @@ app.post("/qa/ask", userAuth, async (req, res) => {
   }
 });
 
+function mean(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function stdDev(arr) {
+  if (arr.length < 2) return 0;
+  const m = mean(arr);
+  const variance = mean(arr.map(x => (x - m) ** 2));
+  return Math.sqrt(variance);
+}
+
+function trendSlope(percentagesChronological) {
+  const n = percentagesChronological.length;
+  if (n < 2) return 0;
+  const xs = percentagesChronological.map((_, i) => i);
+  const xMean = mean(xs);
+  const yMean = mean(percentagesChronological);
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (xs[i] - xMean) * (percentagesChronological[i] - yMean);
+    den += (xs[i] - xMean) ** 2;
+  }
+  return den === 0 ? 0 : num / den;
+}
+
+function sigmoid(z) {
+  return 1 / (1 + Math.exp(-z));
+}
+
+function clamp01(x) {
+  return Math.max(0, Math.min(1, x));
+}
+
+app.get("/user/analytics/selection-probability", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const uid = req.user.uid;
+
+    const results = await Result.find({ userId: uid, isLate: false })
+      .sort({ submittedAt: 1 })
+      .lean();
+
+    if (results.length === 0) {
+      return res.json({
+        hasEnoughData: false,
+        message: "Attempt at least one paid test to see your selection probability estimate.",
+        probability: null,
+      });
+    }
+
+    let totalMarks = 0;
+    results.forEach(r => {
+      totalMarks += calculateNetScore(r.correct || 0, r.incorrect || 0);
+    });
+
+    const betterUsers = await Result.aggregate([
+      { $match: { isLate: false } },
+      {
+        $group: {
+          _id: "$userId",
+          totalMarks: {
+            $sum: { $subtract: [{ $multiply: ["$correct", 2] }, { $multiply: ["$incorrect", 2 / 3] }] }
+          }
+        }
+      },
+      { $match: { totalMarks: { $gt: totalMarks } } },
+      { $count: "count" }
+    ]);
+
+    const rank = (betterUsers[0]?.count || 0) + 1;
+    const totalParticipants = await Result.distinct("userId", { isLate: false })
+      .then(ids => new Set(ids).size);
+
+    const percentileScore = totalParticipants > 1
+      ? clamp01((totalParticipants - rank) / (totalParticipants - 1))
+      : 0.5;
+
+    let totalCorrect = 0, totalIncorrect = 0, totalAttempted = 0, totalQuestions = 0;
+    const percentages = [];
+
+    results.forEach(r => {
+      totalCorrect    += r.correct     || 0;
+      totalIncorrect  += r.incorrect   || 0;
+      totalAttempted  += r.attempted   || 0;
+      totalQuestions  += r.totalQuestions || 0;
+      const pct = r.totalQuestions > 0 ? (r.correct / r.totalQuestions) * 100 : 0;
+      percentages.push(pct);
+    });
+
+    const accuracyScore = (totalCorrect + totalIncorrect) > 0
+      ? clamp01(totalCorrect / (totalCorrect + totalIncorrect))
+      : 0;
+
+    const sd = stdDev(percentages);
+    const consistencyScore = clamp01(1 - sd / 40);
+
+    const attemptRateScore = totalQuestions > 0
+      ? clamp01(totalAttempted / totalQuestions)
+      : 0;
+
+    let trendScore = 0.5;
+    if (percentages.length >= 3) {
+      const slope = trendSlope(percentages);
+      const normalizedSlope = clamp01((slope / 5 + 1) / 2);
+      trendScore = normalizedSlope;
+    }
+
+    const weights = {
+      percentile:  0.35,
+      accuracy:    0.25,
+      consistency: 0.15,
+      attemptRate: 0.10,
+      trend:       0.15,
+    };
+
+    const weightedSum =
+      percentileScore  * weights.percentile +
+      accuracyScore    * weights.accuracy +
+      consistencyScore * weights.consistency +
+      attemptRateScore * weights.attemptRate +
+      trendScore        * weights.trend;
+
+    const z = (weightedSum - 0.5) * 6;
+    const probability = clamp01(sigmoid(z));
+
+    const dataConfidence = results.length >= 10 ? "high" : results.length >= 5 ? "medium" : "low";
+
+    res.json({
+      hasEnoughData: true,
+      probability: Math.round(probability * 1000) / 10,
+      confidence: dataConfidence,
+      testsAnalyzed: results.length,
+      breakdown: {
+        percentile:  { score: Math.round(percentileScore * 100), rank, totalParticipants },
+        accuracy:    { score: Math.round(accuracyScore * 100), totalCorrect, totalIncorrect },
+        consistency: { score: Math.round(consistencyScore * 100), stdDevPercentage: Math.round(sd * 10) / 10 },
+        attemptRate: { score: Math.round(attemptRateScore * 100), totalAttempted, totalQuestions },
+        trend:       { score: Math.round(trendScore * 100) },
+      },
+      weights,
+      message: "This is a statistical estimate based on your mock test performance relative to other aspirants — not an official prediction.",
+    });
+  } catch (err) {
+    console.error("/user/analytics/selection-probability error:", err.message);
+    res.status(500).json({ message: "Failed to calculate selection probability" });
+  }
+});
+
 app.use((req, res) => {
   res.status(404).json({ success: false, message: "Route not found" });
 });
