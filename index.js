@@ -36,7 +36,12 @@ app.options(/.*/, (req, res) => {
   res.sendStatus(204);
 });
 app.use(helmet());
-app.use(compression());
+app.use(compression({
+  filter: (req, res) => {
+    if (req.path === "/qa/ask") return false;
+    return compression.filter(req, res);
+  },
+}));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
 
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
@@ -1773,6 +1778,7 @@ app.post("/qa/ask", userAuth, async (req, res) => {
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
+    req.socket.setNoDelay(true);
     res.flushHeaders();
 
     function sendEvent(event, data) {
