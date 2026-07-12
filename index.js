@@ -565,6 +565,48 @@ app.get("/", async (req, res) => {
     res.status(500).json({ status: "Error", error: err.message });
   }
 });
+app.post("/user/profile", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const user = await User.findOneAndUpdate(
+      { uid: req.user.uid },
+      {
+        $setOnInsert: { uid: req.user.uid },
+        $set: { displayName: req.user.name || "", email: req.user.email || "" },
+      },
+      { upsert: true, new: true }
+    );
+    res.json({
+      success: true,
+      displayName: user.displayName,
+      email: user.email,
+      isPremium: user.isPremium,
+      premiumExpiresAt: user.premiumExpiresAt,
+    });
+  } catch (err) {
+    console.error("/user/profile error:", err.message);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+app.get("/user/profile", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const user = await User.findOne({ uid: req.user.uid }).lean();
+    if (!user) {
+      return res.json({ success: true, displayName: "", email: "", isPremium: false });
+    }
+    res.json({
+      success: true,
+      displayName: user.displayName || "",
+      email: user.email || "",
+      isPremium: user.isPremium,
+      premiumExpiresAt: user.premiumExpiresAt,
+    });
+  } catch (err) {
+    console.error("/user/profile GET error:", err.message);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
 app.get("/subscription/config", userAuth, async (req, res) => {
   try {
     res.json({
@@ -1050,7 +1092,7 @@ app.get("/leaderboard/global", userAuth, async (req, res) => {
   try {
     await connectDB();
     const uid = req.user.uid;
-    const othersLimit = 9;
+    const othersLimit = Math.max(1, Math.min(parseInt(req.query.limit) || 9, 100));
     const topOthers = await Result.aggregate([
       { $match: { isLate: false, userId: { $ne: uid } } },
       {
@@ -1582,19 +1624,15 @@ app.post("/qa/ask", userAuth, async (req, res) => {
       },
       { upsert: true, new: true }
     );
-    if (ENABLE_QUERY_DAILY_LIMIT && !user.isPremium) {
-      const today = todayISTDateKey();
-      const usage = user.qaUsage || {};
-      const usedToday = usage.date === today ? (usage.count || 0) : 0;
-      if (usedToday >= FREE_DAILY_QUERY_LIMIT) {
-        return res.status(429).json({
-          message: "You have used your free question for today. Upgrade to premium for unlimited questions with Ask Cron.",
-          dailyLimit: FREE_DAILY_QUERY_LIMIT,
-          used: usedToday,
-        });
-      }
-      user.qaUsage = { date: today, count: usedToday + 1 };
-      await user.save();
+    const today = todayISTDateKey();
+    const usage = user.qaUsage || {};
+    const usedToday = usage.date === today ? (usage.count || 0) : 0;
+    if (ENABLE_QUERY_DAILY_LIMIT && !user.isPremium && usedToday >= FREE_DAILY_QUERY_LIMIT) {
+      return res.status(429).json({
+        message: "You have used your free question for today. Upgrade to premium for unlimited questions with Ask Cron.",
+        dailyLimit: FREE_DAILY_QUERY_LIMIT,
+        used: usedToday,
+      });
     }
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -1625,6 +1663,10 @@ app.post("/qa/ask", userAuth, async (req, res) => {
     const finalAnswer = await streamPSModel(system, userPrompt, delta => {
       sendEvent("token", { content: delta });
     });
+    if (ENABLE_QUERY_DAILY_LIMIT && !user.isPremium) {
+      user.qaUsage = { date: today, count: usedToday + 1 };
+      await user.save();
+    }
     sendEvent("done", {
       answer: finalAnswer,
       relatedPyqs,
