@@ -1831,6 +1831,62 @@ app.post("/qa/ask", userAuth, async (req, res) => {
   }
 });
 
+app.get("/qa/history", userAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const before = req.query.before;
+
+    const aiConn = await connectAIChatHistoryDB();
+    const AIChatHistory = getAIChatHistoryModel(aiConn);
+
+    const filter = { userId: req.user.uid };
+    if (before) {
+      filter.createdAt = { $lt: new Date(before) };
+    }
+
+    const history = await AIChatHistory.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json({
+      success: true,
+      history: history.map(h => ({
+        id: h._id.toString(),
+        question: h.question,
+        answer: h.answer,
+        relatedPyqs: h.relatedPyqs || [],
+        createdAt: h.createdAt,
+      })),
+      count: history.length,
+    });
+  } catch (err) {
+    console.error("/qa/history error:", err.message);
+    res.status(500).json({ success: false, message: "Failed to fetch chat history" });
+  }
+});
+
+app.delete("/qa/history/:id", userAuth, async (req, res) => {
+  try {
+    const aiConn = await connectAIChatHistoryDB();
+    const AIChatHistory = getAIChatHistoryModel(aiConn);
+
+    const deleted = await AIChatHistory.findOneAndDelete({
+      _id: req.params.id,
+      userId: req.user.uid,
+    });
+
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "History entry not found" });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("/qa/history delete error:", err.message);
+    res.status(500).json({ success: false, message: "Failed to delete history entry" });
+  }
+});
+
 function mean(arr) {
   if (!arr.length) return 0;
   return arr.reduce((a, b) => a + b, 0) / arr.length;
