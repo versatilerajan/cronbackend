@@ -12,6 +12,7 @@ const crypto = require("crypto");
 const { QdrantClient } = require("@qdrant/js-client-rest");
 const { EmbeddingModel, FlagEmbedding } = require("fastembed");
 const app = express();
+app.set("trust proxy", 1);
 app.use(
   express.json({
     limit: "10kb",
@@ -29,12 +30,6 @@ app.use(cors({
   credentials: true,
   optionsSuccessStatus: 204
 }));
-app.options(/.*/, (req, res) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.sendStatus(204);
-});
 app.use(helmet());
 app.use(compression({
   filter: (req, res) => {
@@ -76,6 +71,7 @@ const QA_KNOWLEDGE_BASE_TOP_K = parseInt(process.env.QA_KNOWLEDGE_BASE_TOP_K || 
 const QA_QUESTION_BANK_TOP_K = parseInt(process.env.QA_QUESTION_BANK_TOP_K || "5", 10);
 const FREE_DAILY_QUERY_LIMIT = parseInt(process.env.FREE_DAILY_QUERY_LIMIT || "1", 10);
 const ENABLE_QUERY_DAILY_LIMIT = process.env.ENABLE_QUERY_DAILY_LIMIT !== "false";
+const QA_USAGE_WINDOW_MS = 24 * 60 * 60 * 1000;
 const qdrant = new QdrantClient({ url: QDRANT_URL, apiKey: QDRANT_API_KEY });
 let embedderPromise = null;
 function getEmbedder() {
@@ -130,9 +126,14 @@ ${kbText}
 Write a clear, accurate, well-organized answer for a Civil Services exam aspirant. If the material is insufficient to fully answer, say what is missing rather than fabricating details.`;
   return { system, user };
 }
-async function streamPSModel(system, user, onToken) {
+async function streamPSModel(system, user, onToken, externalSignal) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PSMODEL_TIMEOUT_MS);
+  const onExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener("abort", onExternalAbort);
+  }
   let full = "";
   try {
     const response = await fetch(PSMODEL_ENDPOINT, {
@@ -188,6 +189,7 @@ async function streamPSModel(system, user, onToken) {
     return full;
   } finally {
     clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
   }
 }
 let cached = global.mongoose || { conn: null, promise: null };
@@ -246,6 +248,7 @@ const aiChatHistorySchema = new mongoose.Schema({
   answer: String,
   relatedPyqs: [mongoose.Schema.Types.Mixed],
 }, { timestamps: true });
+aiChatHistorySchema.index({ userId: 1, createdAt: -1 });
 function getAIChatHistoryModel(conn) {
   return conn.models.AIChatHistory || conn.model("AIChatHistory", aiChatHistorySchema, "ai_chat_history");
 }
@@ -316,8 +319,7 @@ const userSchema = new mongoose.Schema({
   planType: { type: String, enum: ["monthly", "yearly", null], default: null },
   lastPaymentId: { type: String, default: null },
   qaUsage: {
-    date: { type: String, default: null },
-    count: { type: Number, default: 0 },
+    askTimestamps: { type: [Date], default: [] },
   },
 }, { timestamps: true });
 const Test       = mongoose.models.Test       || mongoose.model("Test",       testSchema);
@@ -1607,32 +1609,65 @@ app.get("/free/leaderboard/:testId", async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
-function todayISTDateKey() {
-  return toISTDateKey(Date.now());
-}
 app.post("/qa/ask", userAuth, async (req, res) => {
   const question = (req.body?.question || "").trim();
   if (!question) return res.status(400).json({ message: "question is required" });
   if (question.length > 500) return res.status(400).json({ message: "question is too long (max 500 characters)" });
+  let reservedAt = null;
+  let reservedForUid = null;
   try {
     await connectDB();
-    const user = await User.findOneAndUpdate(
+    await User.findOneAndUpdate(
       { uid: req.user.uid },
       {
         $setOnInsert: { uid: req.user.uid },
         $set: { displayName: req.user.name || "", email: req.user.email || "" },
       },
-      { upsert: true, new: true }
+      { upsert: true }
     );
-    const today = todayISTDateKey();
-    const usage = user.qaUsage || {};
-    const usedToday = usage.date === today ? (usage.count || 0) : 0;
-    if (ENABLE_QUERY_DAILY_LIMIT && !user.isPremium && usedToday >= FREE_DAILY_QUERY_LIMIT) {
-      return res.status(429).json({
-        message: "You have used your free question for today. Upgrade to premium for unlimited questions with Ask Cron.",
-        dailyLimit: FREE_DAILY_QUERY_LIMIT,
-        used: usedToday,
-      });
+    let user;
+    if (ENABLE_QUERY_DAILY_LIMIT) {
+      const nowDate = new Date();
+      const windowStart = new Date(nowDate.getTime() - QA_USAGE_WINDOW_MS);
+      const reserved = await User.findOneAndUpdate(
+        {
+          uid: req.user.uid,
+          $or: [
+            { isPremium: true },
+            {
+              $expr: {
+                $lt: [
+                  {
+                    $size: {
+                      $filter: {
+                        input: { $ifNull: ["$qaUsage.askTimestamps", []] },
+                        as: "t",
+                        cond: { $gte: ["$$t", windowStart] },
+                      },
+                    },
+                  },
+                  FREE_DAILY_QUERY_LIMIT,
+                ],
+              },
+            },
+          ],
+        },
+        { $push: { "qaUsage.askTimestamps": { $each: [nowDate], $slice: -50 } } },
+        { new: true }
+      );
+      if (!reserved) {
+        return res.status(429).json({
+          message: "You have used your free question(s) for the last 24 hours. Upgrade to premium for unlimited questions with Ask Cron.",
+          dailyLimit: FREE_DAILY_QUERY_LIMIT,
+        });
+      }
+      user = reserved;
+      if (!user.isPremium) {
+        reservedAt = nowDate;
+        reservedForUid = req.user.uid;
+      }
+    } else {
+      user = await User.findOne({ uid: req.user.uid });
     }
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -1643,6 +1678,10 @@ app.post("/qa/ask", userAuth, async (req, res) => {
     function sendEvent(event, data) {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     }
+    const abortController = new AbortController();
+    req.on("close", () => {
+      abortController.abort();
+    });
     const queryVector = await embedOne(question);
     const [kbPoints, pyqPoints] = await Promise.all([
       searchKnowledgeBase(queryVector, QA_KNOWLEDGE_BASE_TOP_K),
@@ -1660,13 +1699,14 @@ app.post("/qa/ask", userAuth, async (req, res) => {
     });
     const kbText = formatKnowledge(kbPoints);
     const { system, user: userPrompt } = buildAnswerPrompt({ question, kbText });
-    const finalAnswer = await streamPSModel(system, userPrompt, delta => {
-      sendEvent("token", { content: delta });
-    });
-    if (ENABLE_QUERY_DAILY_LIMIT && !user.isPremium) {
-      user.qaUsage = { date: today, count: usedToday + 1 };
-      await user.save();
-    }
+    const finalAnswer = await streamPSModel(
+      system,
+      userPrompt,
+      delta => {
+        sendEvent("token", { content: delta });
+      },
+      abortController.signal
+    );
     sendEvent("done", {
       answer: finalAnswer,
       relatedPyqs,
@@ -1686,6 +1726,16 @@ app.post("/qa/ask", userAuth, async (req, res) => {
     }
   } catch (err) {
     console.error("/qa/ask error:", err.message);
+    if (reservedAt && reservedForUid) {
+      try {
+        await User.updateOne(
+          { uid: reservedForUid },
+          { $pull: { "qaUsage.askTimestamps": reservedAt } }
+        );
+      } catch (rollbackErr) {
+        console.error("[qaUsage rollback]", rollbackErr.message);
+      }
+    }
     if (!res.headersSent) {
       res.status(500).json({ message: "Server error" });
     } else {
