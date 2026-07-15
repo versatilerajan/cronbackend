@@ -242,6 +242,52 @@ async function connectAIChatHistoryDB() {
   aiChatHisCached.conn = await aiChatHisCached.promise;
   return aiChatHisCached.conn;
 }
+let pcsCached = global.pcsConn || { conn: null, promise: null };
+global.pcsConn = pcsCached;
+async function connectPcsDB() {
+  if (pcsCached.conn) return pcsCached.conn;
+  if (!pcsCached.promise) {
+    if (!process.env.QUESTIONDB_URI) throw new Error("QUESTIONDB_URI is missing");
+    pcsCached.promise = mongoose.createConnection(process.env.QUESTIONDB_URI, {
+      serverSelectionTimeoutMS: 15000,
+      connectTimeoutMS: 15000,
+    }).asPromise()
+      .then(conn => {
+        console.log("PCS question DB connected successfully");
+        return conn;
+      })
+      .catch(err => {
+        console.error("PCS question DB connection FAILED:", err.message);
+        pcsCached.promise = null;
+        throw err;
+      });
+  }
+  pcsCached.conn = await pcsCached.promise;
+  return pcsCached.conn;
+}
+let freePcsCached = global.freePcsConn || { conn: null, promise: null };
+global.freePcsConn = freePcsCached;
+async function connectFreePcsDB() {
+  if (freePcsCached.conn) return freePcsCached.conn;
+  if (!freePcsCached.promise) {
+    if (!process.env.FREEPCS_URI) throw new Error("FREEPCS_URI is missing");
+    freePcsCached.promise = mongoose.createConnection(process.env.FREEPCS_URI, {
+      serverSelectionTimeoutMS: 15000,
+      connectTimeoutMS: 15000,
+    }).asPromise()
+      .then(conn => {
+        console.log("Free PCS DB connected successfully");
+        return conn;
+      })
+      .catch(err => {
+        console.error("Free PCS DB connection FAILED:", err.message);
+        freePcsCached.promise = null;
+        throw err;
+      });
+  }
+  freePcsCached.conn = await freePcsCached.promise;
+  return freePcsCached.conn;
+}
 const aiChatHistorySchema = new mongoose.Schema({
   userId: { type: String, index: true },
   question: String,
@@ -251,6 +297,49 @@ const aiChatHistorySchema = new mongoose.Schema({
 aiChatHistorySchema.index({ userId: 1, createdAt: -1 });
 function getAIChatHistoryModel(conn) {
   return conn.models.AIChatHistory || conn.model("AIChatHistory", aiChatHistorySchema, "ai_chat_history");
+}
+const pcsTestSchema = new mongoose.Schema({
+  title: { type: String, required: true, trim: true, maxlength: 200 },
+  date: { type: String, required: true },
+  totalQuestions: { type: Number, default: 0 },
+  testType: { type: String, enum: ["paid", "free"], required: true },
+  phase: { type: String, enum: ["daily", "gs", "csat", "free pcs", null], default: null },
+  collectionName: { type: String, default: null },
+}, { timestamps: true });
+function getPcsTestModel(conn) {
+  return conn.models.Test || conn.model("Test", pcsTestSchema, "tests");
+}
+const freePCSQuestionSchema = new mongoose.Schema({
+  testId: { type: mongoose.Schema.Types.ObjectId, required: true },
+  title: { type: String, trim: true },
+  examType: { type: String, trim: true },
+  year: { type: Number },
+  imageUrl: { type: String, trim: true, default: null },
+  english: {
+    question: String,
+    options: Object,
+    english_explanation: String,
+  },
+  hindi: {
+    question: String,
+    options: Object,
+    hindi_explanation: String,
+  },
+  marks: { type: Number, default: 2 },
+  negativeMarks: { type: Number, default: 0.66 },
+  correct_answer: { type: Number, required: true },
+  phase: { type: String, default: "free pcs" },
+}, { timestamps: true });
+function getFreePCSFallbackModel(conn) {
+  return conn.models.FreePCSQuestion || conn.model("FreePCSQuestion", freePCSQuestionSchema);
+}
+function getFreePCSDynamicModel(conn, collectionName) {
+  return conn.models[collectionName] || conn.model(collectionName, freePCSQuestionSchema, collectionName);
+}
+function pickFreePCSModel(conn, test) {
+  return test && test.collectionName
+    ? getFreePCSDynamicModel(conn, test.collectionName)
+    : getFreePCSFallbackModel(conn);
 }
 let firebaseInitialized = false;
 if (!admin.apps.length) {
@@ -285,7 +374,8 @@ const questionSchema = new mongoose.Schema({
 const resultSchema = new mongoose.Schema({
   userId: String,
   testId: mongoose.Schema.Types.ObjectId,
-  phase: { type: String, enum: ["GS", "CSAT"], required: true },
+  phase: { type: String, enum: ["GS", "CSAT", "free pcs"], required: true },
+  testType: { type: String, enum: ["paid", "free"], default: "paid" },
   score: Number,
   correct: Number,
   incorrect: Number,
@@ -323,7 +413,7 @@ const userSchema = new mongoose.Schema({
   },
 }, { timestamps: true });
 const Test       = mongoose.models.Test       || mongoose.model("Test",       testSchema);
-const Question   = mongoose.models.Question   || mongoose.model("Question",   questionSchema);
+const Question    = mongoose.models.Question   || mongoose.model("Question",   questionSchema);
 const Result     = mongoose.models.Result     || mongoose.model("Result",     resultSchema);
 const FreeResult = mongoose.models.FreeResult || mongoose.model("FreeResult", freeResultSchema);
 const User       = mongoose.models.User       || mongoose.model("User",       userSchema);
@@ -352,13 +442,10 @@ function toISTISOString(utcDate) {
   return shifted.toISOString().replace("Z", "+05:30");
 }
 function isRankRevealTime() {
-  const ist = nowIST();
-  const hours   = ist.getUTCHours();
-  const minutes = ist.getUTCMinutes();
-  return (hours > 17) || (hours === 17 && minutes >= 0);
+  return true;
 }
 function rankRevealTimeIST() {
-  return "5:00 PM IST";
+  return "immediately after submission";
 }
 function toISTDateKey(utcMs) {
   const ist = new Date(utcMs + IST_OFFSET_MS);
@@ -847,6 +934,7 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
       paidDaily:  { count: 0, totalCorrect: 0, totalIncorrect: 0, totalMarks: 0, bestPercentage: 0, avgPercentage: 0, totalTimeSeconds: 0, minTimeSeconds: undefined, maxTimeSeconds: undefined },
       paidPhase1: { count: 0, totalCorrect: 0, totalIncorrect: 0, totalMarks: 0, bestPercentage: 0, avgPercentage: 0, totalTimeSeconds: 0, minTimeSeconds: undefined, maxTimeSeconds: undefined },
       paidPhase2: { count: 0, totalCorrect: 0, totalIncorrect: 0, totalMarks: 0, bestPercentage: 0, avgPercentage: 0, totalTimeSeconds: 0, minTimeSeconds: undefined, maxTimeSeconds: undefined },
+      freePcs:    { count: 0, totalCorrect: 0, totalIncorrect: 0, totalMarks: 0, bestPercentage: 0, avgPercentage: 0, totalTimeSeconds: 0, minTimeSeconds: undefined, maxTimeSeconds: undefined },
     };
     results.forEach(r => {
       totalCorrect      += r.correct      || 0;
@@ -859,6 +947,7 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
       let qtKey = 'paidDaily';
       if (r.phase === 'GS' && r.totalQuestions === 100) qtKey = 'paidPhase1';
       if (r.phase === 'CSAT') qtKey = 'paidPhase2';
+      if (r.phase === 'free pcs') qtKey = 'freePcs';
       const qt = quizTypeStats[qtKey];
       qt.count++;
       qt.totalCorrect   += r.correct   || 0;
@@ -921,7 +1010,10 @@ app.get("/user/analytics/attempts", userAuth, async (req, res) => {
       {
         $addFields: {
           testTitle: {
-            $ifNull: [{ $arrayElemAt: ["$testDoc.title", 0] }, "Paid Test"]
+            $ifNull: [
+              { $arrayElemAt: ["$testDoc.title", 0] },
+              { $cond: [{ $eq: ["$phase", "free pcs"] }, "Free PCS Paper", "Paid Test"] }
+            ]
           }
         }
       }
@@ -931,6 +1023,7 @@ app.get("/user/analytics/attempts", userAuth, async (req, res) => {
       testId:          a.testId.toString(),
       testTitle:       a.testTitle,
       phase:           a.phase,
+      testType:        a.testType || "paid",
       score:           a.score,
       correct:         a.correct,
       incorrect:       a.incorrect,
@@ -1240,6 +1333,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       userId: req.user.uid,
       testId: test._id,
       phase,
+      testType: "paid",
       score,
       correct,
       incorrect,
@@ -1260,7 +1354,6 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       },
       { upsert: true }
     );
-    const rankRevealNow = isRankRevealTime();
     const { rank, totalParticipants } = await computeRank(test._id, phase, score, now);
     const responseBase = {
       phase,
@@ -1271,22 +1364,12 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       totalQuestions:  questions.length,
       isLate,
       ranked:          true,
-      rankRevealTime:  rankRevealTimeIST(),
-      rankRevealNow,
+      rank,
+      totalRankedParticipants: totalParticipants,
+      message: isLate
+        ? "Submitted! Your rank is inserted among on-time participants."
+        : "Test submitted! Here is your rank.",
     };
-    if (!rankRevealNow) {
-      return res.json({
-        ...responseBase,
-        message: isLate
-          ? `Submitted after test window but your attempt is saved! Your rank will be visible at ${rankRevealTimeIST()}.`
-          : `Test submitted successfully! Your rank will be available at ${rankRevealTimeIST()} today.`,
-      });
-    }
-    responseBase.rank                    = rank;
-    responseBase.totalRankedParticipants = totalParticipants;
-    responseBase.message = isLate
-      ? "Submitted! Your rank is inserted among on-time participants."
-      : "Test submitted! Here is your rank.";
     if (test.isSundayFullTest) {
       const gsResult   = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: "GS" });
       const csatResult = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: "CSAT" });
@@ -1328,15 +1411,6 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
     }).lean();
     if (userResults.length === 0) {
       return res.status(404).json({ message: "No attempt found for this test" });
-    }
-    const rankRevealNow = isRankRevealTime();
-    if (!rankRevealNow) {
-      return res.json({
-        rankRevealNow:   false,
-        rankRevealTime:  rankRevealTimeIST(),
-        message:         `Ranks will be revealed at ${rankRevealTimeIST()} today. Come back then!`,
-        hasSubmitted:    true,
-      });
     }
     const response = { phases: {}, rankRevealNow: true };
     for (const r of userResults) {
@@ -1447,18 +1521,14 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
         isCorrect:         userAns ? userAns.selectedOption === q.correctOption : false
       };
     });
-    const rankRevealNow = isRankRevealTime();
-    let rankInfo = null;
-    if (rankRevealNow) {
-      const { rank, totalParticipants } = await computeRank(test._id, result.phase, result.score, result.submittedAt);
-      rankInfo = {
-        phase:             result.phase,
-        score:             Math.round(result.score * 100) / 100,
-        rank,
-        totalParticipants,
-        isLate:            result.isLate || false,
-      };
-    }
+    const { rank, totalParticipants } = await computeRank(test._id, result.phase, result.score, result.submittedAt);
+    const rankInfo = {
+      phase:             result.phase,
+      score:             Math.round(result.score * 100) / 100,
+      rank,
+      totalParticipants,
+      isLate:            result.isLate || false,
+    };
     res.json({
       title:       test.title,
       phase:       result.phase,
@@ -1468,15 +1538,12 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
       unattempted: result.unattempted,
       submittedAt: result.submittedAt.toISOString(),
       isLate:      result.isLate || false,
-      rankRevealNow,
-      rankRevealTime: rankRevealTimeIST(),
+      rankRevealNow: true,
       rankInfo,
       questions: reviewQuestions,
-      message: rankRevealNow
-        ? result.isLate
-          ? "Your rank is inserted among on-time participants."
-          : "Review your answers and performance"
-        : `Rank will be available at ${rankRevealTimeIST()}. Come back then!`
+      message: result.isLate
+        ? "Your rank is inserted among on-time participants."
+        : "Review your answers and performance"
     });
   } catch (err) {
     console.error("/user/review-test error:", err.message);
@@ -1607,6 +1674,191 @@ app.get("/free/leaderboard/:testId", async (req, res) => {
   } catch (err) {
     console.error("/free/leaderboard error:", err.message);
     res.status(500).json({ message: "Server error" });
+  }
+});
+app.get("/free-pcs/papers", async (req, res) => {
+  try {
+    const pcsConn = await connectPcsDB();
+    const PcsTest = getPcsTestModel(pcsConn);
+    const tests = await PcsTest.find({ testType: "free", phase: "free pcs" })
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({
+      success: true,
+      papers: tests.map(t => ({
+        testId:         t._id.toString(),
+        title:          t.title,
+        date:           t.date,
+        totalQuestions: t.totalQuestions,
+        createdAt:      t.createdAt,
+      }))
+    });
+  } catch (err) {
+    console.error("/free-pcs/papers error:", err.message);
+    res.status(500).json({ success: false, message: "Failed to load free PCS papers" });
+  }
+});
+app.get("/free-pcs/paper/:testId", async (req, res) => {
+  try {
+    const pcsConn = await connectPcsDB();
+    const PcsTest = getPcsTestModel(pcsConn);
+    const test = await PcsTest.findById(req.params.testId).lean();
+    if (!test || test.testType !== "free" || test.phase !== "free pcs") {
+      return res.status(404).json({ success: false, message: "Free PCS paper not found" });
+    }
+    const fpConn = await connectFreePcsDB();
+    const Model = pickFreePCSModel(fpConn, test);
+    const questions = await Model.find({ testId: test._id })
+      .select("-correct_answer -english.english_explanation -hindi.hindi_explanation")
+      .sort({ createdAt: 1 })
+      .lean();
+    res.json({
+      success: true,
+      testId:         test._id.toString(),
+      title:          test.title,
+      date:           test.date,
+      totalQuestions: test.totalQuestions,
+      examType:       questions[0]?.examType || null,
+      year:           questions[0]?.year || null,
+      questions,
+    });
+  } catch (err) {
+    console.error("/free-pcs/paper error:", err.message);
+    res.status(500).json({ success: false, message: "Failed to load free PCS paper" });
+  }
+});
+app.post("/free-pcs/submit-test/:testId", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const { answers, timeTakenSeconds } = req.body;
+    if (!Array.isArray(answers)) {
+      return res.status(400).json({ success: false, message: "answers must be an array" });
+    }
+    const pcsConn = await connectPcsDB();
+    const PcsTest = getPcsTestModel(pcsConn);
+    const test = await PcsTest.findById(req.params.testId).lean();
+    if (!test || test.testType !== "free" || test.phase !== "free pcs") {
+      return res.status(404).json({ success: false, message: "Free PCS paper not found" });
+    }
+    const existing = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: "free pcs" });
+    if (existing) {
+      return res.status(403).json({ success: false, message: "You have already submitted this paper", alreadySubmitted: true });
+    }
+    const fpConn = await connectFreePcsDB();
+    const Model = pickFreePCSModel(fpConn, test);
+    const questions = await Model.find({ testId: test._id }).sort({ createdAt: 1 }).lean();
+    if (!questions.length) {
+      return res.status(404).json({ success: false, message: "No questions found for this paper" });
+    }
+    let correct = 0, incorrect = 0, unattempted = 0, attempted = 0;
+    const savedAnswers = [];
+    const reviewQuestions = questions.map(q => {
+      const ans = answers.find(a => a.questionId === q._id.toString());
+      const rawSelected = ans && ans.selectedOption !== undefined && ans.selectedOption !== null
+        ? Number(ans.selectedOption)
+        : null;
+      const selected = rawSelected === null || isNaN(rawSelected) ? null : rawSelected;
+      if (selected === null) {
+        unattempted++;
+      } else {
+        attempted++;
+        if (selected === q.correct_answer) correct++;
+        else incorrect++;
+      }
+      savedAnswers.push({ questionId: q._id.toString(), selectedOption: selected === null ? null : String(selected) });
+      return {
+        questionId:    q._id.toString(),
+        imageUrl:      q.imageUrl || null,
+        english:       q.english,
+        hindi:         q.hindi,
+        correctAnswer: q.correct_answer,
+        yourAnswer:    selected,
+        isCorrect:     selected !== null && selected === q.correct_answer,
+      };
+    });
+    const score = calculateNetScore(correct, incorrect);
+    await Result.create({
+      userId: req.user.uid,
+      testId: test._id,
+      phase: "free pcs",
+      testType: "free",
+      score,
+      correct,
+      incorrect,
+      unattempted,
+      attempted,
+      totalQuestions: questions.length,
+      submittedAt: new Date(),
+      startedAt: new Date(),
+      isLate: false,
+      answers: savedAnswers,
+      timeTakenSeconds: timeTakenSeconds || 0,
+    });
+    await User.findOneAndUpdate(
+      { uid: req.user.uid },
+      {
+        $setOnInsert: { uid: req.user.uid },
+        $set: { displayName: req.user.name || "", email: req.user.email || "" },
+      },
+      { upsert: true }
+    );
+    res.json({
+      success: true,
+      title:          test.title,
+      score:          Math.round(score * 100) / 100,
+      correct,
+      incorrect,
+      unattempted,
+      totalQuestions: questions.length,
+      questions:      reviewQuestions,
+      message:        "Paper submitted. Review your answers and explanations below.",
+    });
+  } catch (err) {
+    console.error("/free-pcs/submit-test error:", err.message);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+app.get("/free-pcs/attempt/:testId", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const result = await Result.findOne({ userId: req.user.uid, testId: req.params.testId, phase: "free pcs" }).lean();
+    if (!result) {
+      return res.status(404).json({ success: false, message: "No attempt found for this paper" });
+    }
+    const pcsConn = await connectPcsDB();
+    const PcsTest = getPcsTestModel(pcsConn);
+    const test = await PcsTest.findById(req.params.testId).lean();
+    const fpConn = await connectFreePcsDB();
+    const Model = pickFreePCSModel(fpConn, test);
+    const questions = await Model.find({ testId: req.params.testId }).sort({ createdAt: 1 }).lean();
+    const answerMap = new Map(result.answers.map(a => [a.questionId, a.selectedOption]));
+    const reviewQuestions = questions.map(q => {
+      const raw = answerMap.get(q._id.toString());
+      const selected = raw === null || raw === undefined ? null : Number(raw);
+      return {
+        questionId:    q._id.toString(),
+        imageUrl:      q.imageUrl || null,
+        english:       q.english,
+        hindi:         q.hindi,
+        correctAnswer: q.correct_answer,
+        yourAnswer:    selected,
+        isCorrect:     selected !== null && selected === q.correct_answer,
+      };
+    });
+    res.json({
+      success: true,
+      title:          test?.title || "",
+      score:          Math.round(result.score * 100) / 100,
+      correct:        result.correct,
+      incorrect:      result.incorrect,
+      unattempted:    result.unattempted,
+      totalQuestions: result.totalQuestions,
+      submittedAt:    result.submittedAt,
+      questions:      reviewQuestions,
+    });
+  } catch (err) {
+    console.error("/free-pcs/attempt error:", err.message);
+    res.status(500).json({ success: false, message: "Server error" });
   }
 });
 app.post("/qa/ask", userAuth, async (req, res) => {
