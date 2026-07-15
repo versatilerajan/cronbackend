@@ -1,6 +1,6 @@
 require("dotenv").config();
 const path = require("path");
-const express=require("express");
+const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -15,7 +15,7 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(
   express.json({
-    limit: "10kb",
+    limit: "512kb",
     verify: (req, res, buf) => {
       if (req.originalUrl === "/subscription/webhook") {
         req.rawBody = buf.toString("utf8");
