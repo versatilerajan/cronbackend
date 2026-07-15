@@ -1683,16 +1683,34 @@ app.get("/free-pcs/papers", async (req, res) => {
     const tests = await PcsTest.find({ testType: "free", phase: "free pcs" })
       .sort({ createdAt: -1 })
       .lean();
-    res.json({
-      success: true,
-      papers: tests.map(t => ({
+
+    const fpConn = await connectFreePcsDB();
+    const papers = await Promise.all(tests.map(async (t) => {
+      let examType = null;
+      let year = null;
+      try {
+        const Model = pickFreePCSModel(fpConn, t);
+        const firstQuestion = await Model.findOne(
+          { testId: t._id },
+          { examType: 1, year: 1 }
+        ).lean();
+        examType = firstQuestion?.examType || null;
+        year = firstQuestion?.year || null;
+      } catch (e) {
+        console.error(`/free-pcs/papers examType lookup failed for ${t._id}:`, e.message);
+      }
+      return {
         testId:         t._id.toString(),
         title:          t.title,
         date:           t.date,
         totalQuestions: t.totalQuestions,
+        examType,
+        year,
         createdAt:      t.createdAt,
-      }))
-    });
+      };
+    }));
+
+    res.json({ success: true, papers });
   } catch (err) {
     console.error("/free-pcs/papers error:", err.message);
     res.status(500).json({ success: false, message: "Failed to load free PCS papers" });
