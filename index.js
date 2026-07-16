@@ -192,6 +192,12 @@ async function streamPSModel(system, user, onToken, externalSignal) {
     if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
   }
 }
+
+// ---------------------------------------------------------------------------
+// DB CONNECTIONS
+// ---------------------------------------------------------------------------
+
+// Default connection (MONGO_URI) — holds Result, FreeResult, User only.
 let cached = global.mongoose || { conn: null, promise: null };
 global.mongoose = cached;
 async function connectDB() {
@@ -219,6 +225,7 @@ async function connectDB() {
   );
   return cached.conn;
 }
+
 let aiChatHisCached = global.aiChatHisConn || { conn: null, promise: null };
 global.aiChatHisConn = aiChatHisCached;
 async function connectAIChatHistoryDB() {
@@ -242,6 +249,9 @@ async function connectAIChatHistoryDB() {
   aiChatHisCached.conn = await aiChatHisCached.promise;
   return aiChatHisCached.conn;
 }
+
+// QUESTIONDB_URI — holds Test + Question for Daily/GS/CSAT (paid & free) AND
+// Free PCS Test metadata. This is the SAME database the admin backend writes to.
 let pcsCached = global.pcsConn || { conn: null, promise: null };
 global.pcsConn = pcsCached;
 async function connectPcsDB() {
@@ -265,6 +275,7 @@ async function connectPcsDB() {
   pcsCached.conn = await pcsCached.promise;
   return pcsCached.conn;
 }
+
 let freePcsCached = global.freePcsConn || { conn: null, promise: null };
 global.freePcsConn = freePcsCached;
 async function connectFreePcsDB() {
@@ -288,6 +299,11 @@ async function connectFreePcsDB() {
   freePcsCached.conn = await freePcsCached.promise;
   return freePcsCached.conn;
 }
+
+// ---------------------------------------------------------------------------
+// SCHEMAS / MODELS
+// ---------------------------------------------------------------------------
+
 const aiChatHistorySchema = new mongoose.Schema({
   userId: { type: String, index: true },
   question: String,
@@ -298,9 +314,16 @@ aiChatHistorySchema.index({ userId: 1, createdAt: -1 });
 function getAIChatHistoryModel(conn) {
   return conn.models.AIChatHistory || conn.model("AIChatHistory", aiChatHistorySchema, "ai_chat_history");
 }
+
+// Test schema — MUST mirror the admin backend's testSchema exactly (same DB,
+// same collection "tests"). Includes startTime/endTime (used for the
+// not-started / active gating) and phase (daily -> 75q, gs -> 100q, csat -> 80q,
+// "free pcs" -> handled entirely by the free-pcs routes further below).
 const pcsTestSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true, maxlength: 200 },
   date: { type: String, required: true },
+  startTime: { type: Date },
+  endTime: { type: Date },
   totalQuestions: { type: Number, default: 0 },
   testType: { type: String, enum: ["paid", "free"], required: true },
   phase: { type: String, enum: ["daily", "gs", "csat", "free pcs", null], default: null },
@@ -309,6 +332,34 @@ const pcsTestSchema = new mongoose.Schema({
 function getPcsTestModel(conn) {
   return conn.models.Test || conn.model("Test", pcsTestSchema, "tests");
 }
+
+// Bilingual Question schema — MUST mirror the admin backend's questionSchema
+// exactly (same DB, same collection "questions"). Used for Daily/GS/CSAT
+// (paid & free) questions only. Free PCS questions use their own dynamic
+// per-paper collections (freePCSQuestionSchema below), untouched.
+const bilingualQuestionSchema = new mongoose.Schema({
+  testId: { type: mongoose.Schema.Types.ObjectId, ref: "Test", required: true },
+  imageUrl: { type: String, trim: true, default: null },
+  english: {
+    question: String,
+    options: Object,
+    english_explanation: String,
+  },
+  hindi: {
+    question: String,
+    options: Object,
+    hindi_explanation: String,
+  },
+  marks: { type: Number, default: 2 },
+  negativeMarks: { type: Number, default: 0.66 },
+  correct_answer: { type: Number, required: true },
+  phase: { type: String, enum: ["GS", "CSAT"], default: "GS" },
+}, { timestamps: true });
+function getQuestionModel(conn) {
+  return conn.models.Question || conn.model("Question", bilingualQuestionSchema, "questions");
+}
+
+// Free PCS question schema — unchanged, already correct.
 const freePCSQuestionSchema = new mongoose.Schema({
   testId: { type: mongoose.Schema.Types.ObjectId, required: true },
   title: { type: String, trim: true },
@@ -341,6 +392,7 @@ function pickFreePCSModel(conn, test) {
     ? getFreePCSDynamicModel(conn, test.collectionName)
     : getFreePCSFallbackModel(conn);
 }
+
 let firebaseInitialized = false;
 if (!admin.apps.length) {
   try {
@@ -354,23 +406,8 @@ if (!admin.apps.length) {
     console.error("Firebase Admin Initialization FAILED:", err.message);
   }
 }
-const testSchema = new mongoose.Schema({
-  title: String,
-  date: String,
-  startTime: Date,
-  endTime: Date,
-  totalQuestions: Number,
-  testType: { type: String, enum: ["paid", "free"], required: true },
-  isSundayFullTest: { type: Boolean, default: false },
-}, { timestamps: true });
-const questionSchema = new mongoose.Schema({
-  testId: mongoose.Schema.Types.ObjectId,
-  questionNumber: Number,
-  questionStatement: String,
-  options: { option1: String, option2: String, option3: String, option4: String },
-  correctOption: String,
-  phase: { type: String, enum: ["GS", "CSAT"], default: "GS" }
-});
+
+// Result / FreeResult / User — these live on the default connection (MONGO_URI).
 const resultSchema = new mongoose.Schema({
   userId: String,
   testId: mongoose.Schema.Types.ObjectId,
@@ -412,11 +449,10 @@ const userSchema = new mongoose.Schema({
     askTimestamps: { type: [Date], default: [] },
   },
 }, { timestamps: true });
-const Test       = mongoose.models.Test       || mongoose.model("Test",       testSchema);
-const Question    = mongoose.models.Question   || mongoose.model("Question",   questionSchema);
 const Result     = mongoose.models.Result     || mongoose.model("Result",     resultSchema);
 const FreeResult = mongoose.models.FreeResult || mongoose.model("FreeResult", freeResultSchema);
 const User       = mongoose.models.User       || mongoose.model("User",       userSchema);
+
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) return res.status(503).json({ message: "Auth service unavailable" });
   const authHeader = req.headers.authorization;
@@ -536,7 +572,15 @@ async function computeRank(testId, phase, score, submittedAt) {
   const total = await Result.countDocuments({ testId, phase, isLate: false });
   return { rank: better + 1, totalParticipants: total };
 }
-async function buildTestResponse(test, userId, istNow) {
+
+// ---------------------------------------------------------------------------
+// buildTestResponse — Daily/GS/CSAT (paid). Each admin-created test document
+// has exactly ONE phase ("daily" | "gs" | "csat"), each mapping to exactly one
+// question-level phase ("daily"/"gs" -> "GS" questions, "csat" -> "CSAT"
+// questions). There is no more combined "Sunday full test" concept — GS and
+// CSAT are always separate Test documents with separate testIds.
+// ---------------------------------------------------------------------------
+async function buildTestResponse(conn, test, userId, istNow) {
   const startIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
   const endIST   = new Date(test.endTime.getTime()   + IST_OFFSET_MS);
   const testDateParts = (test.date || "").split("-");
@@ -547,15 +591,14 @@ async function buildTestResponse(test, userId, istNow) {
     const endOfDayIST = new Date(endOfDayUTC.getTime() + IST_OFFSET_MS);
     deadlineIST = endOfDayIST > endIST ? endOfDayIST : endIST;
   }
-  const existingPhases = ["GS"];
-  if (test.isSundayFullTest) existingPhases.push("CSAT");
-  const userResults = await Result.find({
-    userId,
-    testId: test._id,
-    phase: { $in: existingPhases },
+
+  const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
+
+  const userResult = await Result.findOne({
+    userId, testId: test._id, phase: questionPhase,
   }).lean();
-  const submittedPhases = userResults.map(r => r.phase);
-  const hasSubmitted    = submittedPhases.length > 0;
+  const hasSubmitted = !!userResult;
+
   if (istNow < startIST) {
     return {
       status: "not_started",
@@ -565,17 +608,19 @@ async function buildTestResponse(test, userId, istNow) {
       endTimeIST: toISTISOString(test.endTime),
       deadlineIST: toISTISOString(new Date(deadlineIST.getTime() - IST_OFFSET_MS)),
       totalQuestions: test.totalQuestions,
-      isSundayFullTest: !!test.isSundayFullTest,
+      phase: test.phase,
       hasSubmitted: false,
-      submittedPhases: [],
-      message: "Test has not started yet"
+      message: "Test has not started yet",
     };
   }
+
+  const Question = getQuestionModel(conn);
   const questions = await Question.find({ testId: test._id })
-    .select("-correctOption")
-    .sort({ questionNumber: 1 })
+    .select("-correct_answer -english.english_explanation -hindi.hindi_explanation")
+    .sort({ createdAt: 1 })
     .lean();
-  const response = {
+
+  return {
     status: "active",
     testId: test._id.toString(),
     title: test.title,
@@ -583,24 +628,15 @@ async function buildTestResponse(test, userId, istNow) {
     startTimeIST: toISTISOString(test.startTime),
     endTimeIST: toISTISOString(test.endTime),
     deadlineIST: toISTISOString(new Date(deadlineIST.getTime() - IST_OFFSET_MS)),
-    isSundayFullTest: !!test.isSundayFullTest,
+    phase: test.phase,
+    questionPhase,
     hasSubmitted,
-    submittedPhases,
     isPersistentPaidTest: true,
     note: "This paid test paper remains available anytime until removed by admin",
+    questions,
   };
-  if (test.isSundayFullTest) {
-    const gs   = questions.filter(q => q.phase === "GS");
-    const csat = questions.filter(q => q.phase === "CSAT");
-    response.phases = {
-      GS:   { count: gs.length,   questions: gs   },
-      CSAT: { count: csat.length, questions: csat },
-    };
-  } else {
-    response.questions = questions;
-  }
-  return response;
 }
+
 function verifyWebhookSignature(rawBody, signature) {
   const expected = crypto
     .createHmac("sha256", RAZORPAY_WEBHOOK_SECRET)
@@ -626,6 +662,11 @@ async function syncSubscription(uid) {
     subscriptionId: user.subscriptionId,
   };
 }
+
+// ---------------------------------------------------------------------------
+// ROUTES
+// ---------------------------------------------------------------------------
+
 app.get("/", async (req, res) => {
   try {
     await connectDB();
@@ -640,6 +681,7 @@ app.get("/", async (req, res) => {
     res.status(500).json({ status: "Error", error: err.message });
   }
 });
+
 app.post("/user/profile", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -682,6 +724,7 @@ app.get("/user/profile", userAuth, async (req, res) => {
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
+
 app.get("/subscription/config", userAuth, async (req, res) => {
   try {
     res.json({
@@ -888,6 +931,7 @@ app.post("/subscription/webhook", async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 app.get("/user/analytics/summary", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -976,38 +1020,34 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
     res.status(500).json({ message: "Failed to fetch analytics summary" });
   }
 });
+
+// FIXED: Test docs live in a different database (QUESTIONDB_URI) than Result
+// docs (MONGO_URI). MongoDB's $lookup cannot join across databases, so we
+// fetch tests separately and merge titles in app code instead.
 app.get("/user/analytics/attempts", userAuth, async (req, res) => {
   try {
     await connectDB();
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+
     const uid   = req.user.uid;
     const limit = parseInt(req.query.limit) || 30;
-    const attempts = await Result.aggregate([
-      { $match: { userId: uid } },
-      { $sort: { submittedAt: -1 } },
-      { $limit: limit },
-      {
-        $lookup: {
-          from: "tests",
-          localField: "testId",
-          foreignField: "_id",
-          as: "testDoc"
-        }
-      },
-      {
-        $addFields: {
-          testTitle: {
-            $ifNull: [
-              { $arrayElemAt: ["$testDoc.title", 0] },
-              { $cond: [{ $eq: ["$phase", "free pcs"] }, "Free PCS Paper", "Paid Test"] }
-            ]
-          }
-        }
-      }
-    ]);
+
+    const attempts = await Result.find({ userId: uid })
+      .sort({ submittedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const testIds = [...new Set(
+      attempts.filter(a => a.phase !== "free pcs").map(a => a.testId.toString())
+    )];
+    const testDocs = testIds.length ? await Test.find({ _id: { $in: testIds } }).lean() : [];
+    const titleMap = new Map(testDocs.map(t => [t._id.toString(), t.title]));
+
     res.json(attempts.map(a => ({
       _id:             a._id.toString(),
       testId:          a.testId.toString(),
-      testTitle:       a.testTitle,
+      testTitle:       a.phase === "free pcs" ? "Free PCS Paper" : (titleMap.get(a.testId.toString()) || "Paid Test"),
       phase:           a.phase,
       testType:        a.testType || "paid",
       score:           a.score,
@@ -1024,23 +1064,31 @@ app.get("/user/analytics/attempts", userAuth, async (req, res) => {
     res.status(500).json({ message: "Failed to fetch attempts" });
   }
 });
+
+// FIXED: now reads Test from QUESTIONDB_URI (via connectPcsDB), matching where
+// the admin backend actually writes Daily/GS/CSAT tests.
 app.get("/user/today-test", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const istNow  = nowIST();
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+    const istNow   = nowIST();
     const todayIST = istNow.toISOString().split("T")[0];
-    const test = await Test.findOne({ date: todayIST, testType: "paid" });
+    const test = await Test.findOne({ date: todayIST, testType: "paid" }).lean();
     if (!test) return res.status(404).json({ message: "No paid test available today" });
-    const response = await buildTestResponse(test, req.user.uid, istNow);
+    const response = await buildTestResponse(conn, test, req.user.uid, istNow);
     res.json(response);
   } catch (err) {
     console.error("/user/today-test error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/user/today-tests", userAuth, async (req, res) => {
   try {
     await connectDB();
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
     const istNow   = nowIST();
     const todayIST = istNow.toISOString().split("T")[0];
     const tests = await Test.find({ date: todayIST, testType: "paid" })
@@ -1048,7 +1096,7 @@ app.get("/user/today-tests", userAuth, async (req, res) => {
       .lean();
     if (!tests.length) return res.status(404).json({ message: "No paid tests available today" });
     const responses = await Promise.all(
-      tests.map(test => buildTestResponse(test, req.user.uid, istNow))
+      tests.map(test => buildTestResponse(conn, test, req.user.uid, istNow))
     );
     res.json({ tests: responses, count: responses.length });
   } catch (err) {
@@ -1056,16 +1104,19 @@ app.get("/user/today-tests", userAuth, async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/user/paid-tests", userAuth, async (req, res) => {
   try {
     await connectDB();
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
     const tests = await Test.find({ testType: "paid" })
       .sort({ date: -1, startTime: -1 })
       .lean();
     if (!tests.length) return res.status(404).json({ message: "No paid tests available" });
     const istNow = nowIST();
     const responses = await Promise.all(
-      tests.map(test => buildTestResponse(test, req.user.uid, istNow))
+      tests.map(test => buildTestResponse(conn, test, req.user.uid, istNow))
     );
     res.json({ tests: responses, count: responses.length });
   } catch (err) {
@@ -1073,79 +1124,64 @@ app.get("/user/paid-tests", userAuth, async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/user/paid-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const test = await Test.findOne({ _id: req.params.testId, testType: "paid" });
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+    const test = await Test.findOne({ _id: req.params.testId, testType: "paid" }).lean();
     if (!test) return res.status(404).json({ message: "Paid test not found" });
     const istNow = nowIST();
-    const response = await buildTestResponse(test, req.user.uid, istNow);
+    const response = await buildTestResponse(conn, test, req.user.uid, istNow);
     res.json(response);
   } catch (err) {
     console.error("/user/paid-test/:testId error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const test = await Test.findById(req.params.testId);
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+    const test = await Test.findById(req.params.testId).lean();
     if (!test) return res.status(404).json({ message: "Test not found" });
-    const phases = test.isSundayFullTest ? ["GS", "CSAT"] : ["GS"];
-    const userResults = await Result.find({
-      userId: req.user.uid,
-      testId: test._id,
-      phase: { $in: phases },
+
+    const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
+    const result = await Result.findOne({
+      userId: req.user.uid, testId: test._id, phase: questionPhase,
     }).lean();
-    const submittedPhases = userResults.map(r => r.phase);
-    const hasSubmitted    = submittedPhases.length > 0;
-    const rankRevealNow   = isRankRevealTime();
+    const hasSubmitted = !!result;
+
     const response = {
       hasSubmitted,
-      submittedPhases,
+      phase: questionPhase,
       rankRevealTime: rankRevealTimeIST(),
-      rankRevealNow,
+      rankRevealNow: isRankRevealTime(),
     };
-    if (hasSubmitted && rankRevealNow) {
-      const rankData = {};
-      for (const r of userResults) {
-        const { rank, totalParticipants } = await computeRank(test._id, r.phase, r.score, r.submittedAt);
-        rankData[r.phase] = {
-          score:             Math.round(r.score * 100) / 100,
-          correct:           r.correct,
-          incorrect:         r.incorrect,
-          unattempted:       r.unattempted,
-          rank,
-          totalParticipants,
-          isLate:            r.isLate || false,
-        };
-      }
-      response.rankData = rankData;
-      if (test.isSundayFullTest && userResults.length === 2) {
-        const combinedScore = userResults.reduce((sum, r) => sum + r.score, 0);
-        const betterCombined = await Result.aggregate([
-          { $match: { testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] } } },
-          { $group: { _id: "$userId", total: { $sum: "$score" } } },
-          { $match: { total: { $gt: combinedScore } } },
-          { $count: "count" }
-        ]);
-        const combinedRank = (betterCombined[0]?.count || 0) + 1;
-        const totalUsers = await Result.distinct("userId", {
-          testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] }
-        }).then(ids => new Set(ids).size);
-        response.combinedRank = {
-          score: Math.round(combinedScore * 100) / 100,
-          rank:  combinedRank,
-          totalParticipants: totalUsers
-        };
-      }
+
+    if (hasSubmitted) {
+      const { rank, totalParticipants } = await computeRank(test._id, questionPhase, result.score, result.submittedAt);
+      response.rankData = {
+        score: Math.round(result.score * 100) / 100,
+        correct: result.correct,
+        incorrect: result.incorrect,
+        unattempted: result.unattempted,
+        rank,
+        totalParticipants,
+        isLate: result.isLate || false,
+      };
     }
+
     res.json(response);
   } catch (err) {
     console.error("/user/submission-status error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/user/overall-rank", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -1199,6 +1235,7 @@ app.get("/user/overall-rank", userAuth, async (req, res) => {
     res.status(500).json({ message: "Failed to calculate overall rank" });
   }
 });
+
 app.get("/leaderboard/global", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -1290,20 +1327,29 @@ app.get("/leaderboard/global", userAuth, async (req, res) => {
     res.status(500).json({ message: "Failed to fetch global leaderboard" });
   }
 });
+
+// FIXED: now uses connectPcsDB (QUESTIONDB_URI) + bilingual Question schema;
+// phase is derived from the test document (not taken from the request body);
+// selectedOption/correct_answer are compared as Numbers.
 app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const { phase, answers, timeTakenSeconds } = req.body;
-    if (!["GS", "CSAT"].includes(phase)) {
-      return res.status(400).json({ message: "phase must be 'GS' or 'CSAT'" });
-    }
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+    const Question = getQuestionModel(conn);
+
+    const { answers, timeTakenSeconds } = req.body;
     if (!Array.isArray(answers)) {
       return res.status(400).json({ message: "answers must be an array of objects" });
     }
-    const test = await Test.findById(req.params.testId);
+
+    const test = await Test.findById(req.params.testId).lean();
     if (!test || test.testType !== "paid") {
       return res.status(404).json({ message: "Paid test not found" });
     }
+
+    const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
+
     const istNow  = nowIST();
     const endIST  = new Date(test.endTime.getTime() + IST_OFFSET_MS);
     const testDateParts = (test.date || "").split("-");
@@ -1320,35 +1366,44 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
     }
     const isLate = istNow > deadlineIST;
     const now    = new Date();
-    const existing = await Result.findOne({ userId: req.user.uid, testId: test._id, phase });
+
+    const existing = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: questionPhase });
     if (existing) {
       return res.status(403).json({
-        message: `You have already submitted ${phase} phase. You can only preview your attempt.`,
+        message: "You have already submitted this test. You can only preview your attempt.",
         alreadySubmitted: true
       });
     }
-    let qFilter = { testId: test._id };
-    if (test.isSundayFullTest) qFilter.phase = phase;
-    const questions = await Question.find(qFilter).lean();
+
+    const questions = await Question.find({ testId: test._id }).lean();
     if (questions.length === 0) {
-      return res.status(404).json({ message: "No questions found for this phase" });
+      return res.status(404).json({ message: "No questions found for this test" });
     }
+
     let correct = 0, incorrect = 0, unattempted = 0, attempted = 0;
-    const savedAnswers = answers.map(ans => {
-      const q = questions.find(qq => qq._id.toString() === ans.questionId);
-      if (!q) return { questionId: ans.questionId, selectedOption: null };
-      const selected = ans.selectedOption;
-      if (!selected) { unattempted++; return { questionId: ans.questionId, selectedOption: null }; }
-      attempted++;
-      if (selected === q.correctOption) correct++;
-      else incorrect++;
-      return { questionId: ans.questionId, selectedOption: selected };
+    const savedAnswers = [];
+    questions.forEach(q => {
+      const ans = answers.find(a => a.questionId === q._id.toString());
+      const raw = ans && ans.selectedOption !== undefined && ans.selectedOption !== null
+        ? Number(ans.selectedOption)
+        : null;
+      const selected = raw === null || isNaN(raw) ? null : raw;
+      if (selected === null) {
+        unattempted++;
+      } else {
+        attempted++;
+        if (selected === q.correct_answer) correct++;
+        else incorrect++;
+      }
+      savedAnswers.push({ questionId: q._id.toString(), selectedOption: selected === null ? null : String(selected) });
     });
+
     const score = calculateNetScore(correct, incorrect);
+
     await Result.create({
       userId: req.user.uid,
       testId: test._id,
-      phase,
+      phase: questionPhase,
       testType: "paid",
       score,
       correct,
@@ -1362,6 +1417,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       answers: savedAnswers,
       timeTakenSeconds: timeTakenSeconds || 0
     });
+
     await User.findOneAndUpdate(
       { uid: req.user.uid },
       {
@@ -1370,9 +1426,11 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       },
       { upsert: true }
     );
-    const { rank, totalParticipants } = await computeRank(test._id, phase, score, now);
-    const responseBase = {
-      phase,
+
+    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, score, now);
+
+    res.json({
+      phase:           questionPhase,
       score:           Math.round(score * 100) / 100,
       correct,
       incorrect,
@@ -1385,169 +1443,116 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       message: isLate
         ? "Submitted! Your rank is inserted among on-time participants."
         : "Test submitted! Here is your rank.",
-    };
-    if (test.isSundayFullTest) {
-      const gsResult   = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: "GS" });
-      const csatResult = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: "CSAT" });
-      if (gsResult && csatResult) {
-        const combinedScore = gsResult.score + csatResult.score;
-        const betterCombined = await Result.aggregate([
-          { $match: { testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] } } },
-          { $group: { _id: "$userId", totalScore: { $sum: "$score" } } },
-          { $match: { totalScore: { $gt: combinedScore } } },
-          { $count: "count" }
-        ]);
-        const combinedRank = (betterCombined[0]?.count || 0) + 1;
-        const totalUnique  = await Result.distinct("userId", {
-          testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] }
-        }).then(arr => new Set(arr).size);
-        responseBase.combined = {
-          score: Math.round(combinedScore * 100) / 100,
-          rank:  combinedRank,
-          totalParticipants: totalUnique
-        };
-      }
-    }
-    res.json(responseBase);
+    });
   } catch (err) {
     console.error("/user/submit-test error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const test = await Test.findById(req.params.testId);
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+    const test = await Test.findById(req.params.testId).lean();
     if (!test) return res.status(404).json({ message: "Test not found" });
-    const phases = test.isSundayFullTest ? ["GS", "CSAT"] : ["GS"];
-    const userResults = await Result.find({
-      userId: req.user.uid,
-      testId: test._id,
-      phase: { $in: phases },
-    }).lean();
-    if (userResults.length === 0) {
+
+    const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
+    const result = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: questionPhase }).lean();
+    if (!result) {
       return res.status(404).json({ message: "No attempt found for this test" });
     }
-    const response = { phases: {}, rankRevealNow: true };
-    for (const r of userResults) {
-      const { rank, totalParticipants } = await computeRank(test._id, r.phase, r.score, r.submittedAt);
-      response.phases[r.phase] = {
-        score:             Math.round(r.score * 100) / 100,
-        correct:           r.correct,
-        incorrect:         r.incorrect,
-        unattempted:       r.unattempted,
-        rank,
-        totalParticipants,
-        isLate:            r.isLate || false,
-      };
-    }
-    if (test.isSundayFullTest && userResults.length === 2) {
-      const combinedScore = userResults.reduce((sum, r) => sum + r.score, 0);
-      const betterCombined = await Result.aggregate([
-        { $match: { testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] } } },
-        { $group: { _id: "$userId", total: { $sum: "$score" } } },
-        { $match: { total: { $gt: combinedScore } } },
-        { $count: "count" }
-      ]);
-      const combinedRank = (betterCombined[0]?.count || 0) + 1;
-      const totalUsers   = await Result.distinct("userId", {
-        testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] }
-      }).then(ids => new Set(ids).size);
-      response.combined = {
-        score: Math.round(combinedScore * 100) / 100,
-        rank:  combinedRank,
-        totalParticipants: totalUsers
-      };
-    }
-    res.json(response);
+
+    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, result.score, result.submittedAt);
+    res.json({
+      rankRevealNow: true,
+      phase: questionPhase,
+      score: Math.round(result.score * 100) / 100,
+      correct: result.correct,
+      incorrect: result.incorrect,
+      unattempted: result.unattempted,
+      rank,
+      totalParticipants,
+      isLate: result.isLate || false,
+    });
   } catch (err) {
     console.error("/user/my-rank error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const test = await Test.findById(req.params.testId);
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+    const test = await Test.findById(req.params.testId).lean();
     if (!test) return res.status(404).json({ message: "Test not found" });
-    if (!test.isSundayFullTest) {
-      const results = await Result.find({ testId: test._id, phase: "GS", isLate: false })
-        .sort({ score: -1, submittedAt: 1 })
-        .limit(50)
-        .lean();
-      const total = await Result.countDocuments({ testId: test._id, phase: "GS", isLate: false });
-      return res.json({
-        phase: "GS",
-        leaderboard: results.map(r => ({
-          userId: r.userId,
-          score:  Math.round(r.score * 100) / 100,
-          submittedAt: r.submittedAt
-        })),
-        totalRankedParticipants: total,
-        note: "On-time GS attempts"
-      });
-    }
-    const gsResults   = await Result.find({ testId: test._id, phase: "GS",   isLate: false }).sort({ score: -1, submittedAt: 1 }).limit(20).lean();
-    const csatResults = await Result.find({ testId: test._id, phase: "CSAT", isLate: false }).sort({ score: -1, submittedAt: 1 }).limit(20).lean();
-    const combined    = await Result.aggregate([
-      { $match: { testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] } } },
-      { $group: { _id: "$userId", totalScore: { $sum: "$score" }, gsScore: { $sum: { $cond: [{ $eq: ["$phase", "GS"] }, "$score", 0] } }, csatScore: { $sum: { $cond: [{ $eq: ["$phase", "CSAT"] }, "$score", 0] } } } },
-      { $sort: { totalScore: -1 } },
-      { $limit: 20 }
-    ]);
+
+    const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
+    const results = await Result.find({ testId: test._id, phase: questionPhase, isLate: false })
+      .sort({ score: -1, submittedAt: 1 })
+      .limit(50)
+      .lean();
+    const total = await Result.countDocuments({ testId: test._id, phase: questionPhase, isLate: false });
+
     res.json({
-      isSundayFullTest: true,
-      gs:   { leaderboard: gsResults.map(r => ({ userId: r.userId, score: Math.round(r.score*100)/100 })), total: await Result.countDocuments({ testId: test._id, phase: "GS", isLate: false }) },
-      csat: { leaderboard: csatResults.map(r => ({ userId: r.userId, score: Math.round(r.score*100)/100 })), total: await Result.countDocuments({ testId: test._id, phase: "CSAT", isLate: false }) },
-      combined: {
-        leaderboard: combined.map((e, i) => ({ rank: i+1, userId: e._id, totalScore: Math.round(e.totalScore*100)/100, gs: Math.round(e.gsScore*100)/100, csat: Math.round(e.csatScore*100)/100 })),
-        totalUniqueParticipants: await Result.distinct("userId", { testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] } }).then(a => a.length)
-      }
+      phase: questionPhase,
+      leaderboard: results.map(r => ({
+        userId: r.userId,
+        score:  Math.round(r.score * 100) / 100,
+        submittedAt: r.submittedAt
+      })),
+      totalRankedParticipants: total,
+      note: "On-time attempts"
     });
   } catch (err) {
     console.error("/user/leaderboard error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/user/review-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const test = await Test.findById(req.params.testId);
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+    const Question = getQuestionModel(conn);
+
+    const test = await Test.findById(req.params.testId).lean();
     if (!test || test.testType !== "paid") {
       return res.status(404).json({ message: "Test not found or not paid" });
     }
-    const phase = req.query.phase || "GS";
-    let filter = { userId: req.user.uid, testId: test._id };
-    if (test.isSundayFullTest) filter.phase = phase;
-    const result = await Result.findOne(filter);
+
+    const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
+    const result = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: questionPhase }).lean();
     if (!result) {
-      return res.status(404).json({ message: `No submission found for phase ${phase}` });
+      return res.status(404).json({ message: "No submission found for this test" });
     }
-    let qFilter = { testId: test._id };
-    if (test.isSundayFullTest) qFilter.phase = phase;
-    const questions = await Question.find(qFilter).sort({ questionNumber: 1 }).lean();
+
+    const questions = await Question.find({ testId: test._id }).sort({ createdAt: 1 }).lean();
+    const answerMap = new Map(result.answers.map(a => [a.questionId, a.selectedOption]));
+
     const reviewQuestions = questions.map(q => {
-      const userAns = result.answers.find(a => a.questionId === q._id.toString());
+      const raw = answerMap.get(q._id.toString());
+      const selected = raw === null || raw === undefined ? null : Number(raw);
       return {
-        questionNumber:    q.questionNumber,
-        questionStatement: q.questionStatement,
-        options:           q.options,
-        yourAnswer:        userAns?.selectedOption || null,
-        correctAnswer:     q.correctOption,
-        isCorrect:         userAns ? userAns.selectedOption === q.correctOption : false
+        questionId:    q._id.toString(),
+        imageUrl:      q.imageUrl || null,
+        english:       q.english,
+        hindi:         q.hindi,
+        correctAnswer: q.correct_answer,
+        yourAnswer:    selected,
+        isCorrect:     selected !== null && selected === q.correct_answer,
       };
     });
-    const { rank, totalParticipants } = await computeRank(test._id, result.phase, result.score, result.submittedAt);
-    const rankInfo = {
-      phase:             result.phase,
-      score:             Math.round(result.score * 100) / 100,
-      rank,
-      totalParticipants,
-      isLate:            result.isLate || false,
-    };
+
+    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, result.score, result.submittedAt);
+
     res.json({
       title:       test.title,
-      phase:       result.phase,
+      phase:       questionPhase,
       score:       Math.round(result.score * 100) / 100,
       correct:     result.correct,
       incorrect:   result.incorrect,
@@ -1555,7 +1560,7 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
       submittedAt: result.submittedAt.toISOString(),
       isLate:      result.isLate || false,
       rankRevealNow: true,
-      rankInfo,
+      rankInfo: { rank, totalParticipants },
       questions: reviewQuestions,
       message: result.isLate
         ? "Your rank is inserted among on-time participants."
@@ -1566,21 +1571,25 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
+// FIXED: free Daily/GS/CSAT tests now also read from QUESTIONDB_URI with the
+// bilingual schema.
 app.get("/free/tests", async (req, res) => {
   try {
-    await connectDB();
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
     const tests = await Test.find({ testType: "free" })
       .sort({ createdAt: -1 })
-      .select("title date totalQuestions startTime endTime createdAt")
       .lean();
     if (!tests.length) return res.status(404).json({ message: "No free tests available" });
     res.json({
       success: true,
       tests: tests.map(t => ({
         testId:         t._id.toString(),
-        title:          t.title || "BPSC Free Practice Test",
+        title:          t.title || "Free Practice Test",
         date:           t.date  || "—",
         totalQuestions: t.totalQuestions,
+        phase:          t.phase,
         createdAt:      t.createdAt ? new Date(t.createdAt).toISOString() : null,
         startTimeIST:   t.startTime ? toISTISOString(t.startTime) : null,
         endTimeIST:     t.endTime   ? toISTISOString(t.endTime)   : null,
@@ -1591,18 +1600,28 @@ app.get("/free/tests", async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/free/test/:testId", async (req, res) => {
   try {
-    await connectDB();
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+    const Question = getQuestionModel(conn);
+
     const test = await Test.findOne({ _id: req.params.testId, testType: "free" }).lean();
     if (!test) return res.status(404).json({ message: "Free test not found" });
-    const questions = await Question.find({ testId: test._id }).select("-correctOption").lean();
+
+    const questions = await Question.find({ testId: test._id })
+      .select("-correct_answer -english.english_explanation -hindi.hindi_explanation")
+      .sort({ createdAt: 1 })
+      .lean();
+
     res.json({
       status:         "active",
       testId:         test._id.toString(),
-      title:          test.title || "BPSC Free Practice Test",
+      title:          test.title || "Free Practice Test",
       totalQuestions: test.totalQuestions,
       date:           test.date,
+      phase:          test.phase,
       questions,
       note:                 "Persistent free practice test — available anytime until removed by admin",
       isPersistentFreeTest: true
@@ -1612,18 +1631,28 @@ app.get("/free/test/:testId", async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/free/today-test", async (req, res) => {
   try {
-    await connectDB();
+    const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
+    const Question = getQuestionModel(conn);
+
     const test = await Test.findOne({ testType: "free" }).sort({ createdAt: -1 }).lean();
     if (!test) return res.status(404).json({ message: "No free test available at the moment" });
-    const questions = await Question.find({ testId: test._id }).select("-correctOption").lean();
+
+    const questions = await Question.find({ testId: test._id })
+      .select("-correct_answer -english.english_explanation -hindi.hindi_explanation")
+      .sort({ createdAt: 1 })
+      .lean();
+
     res.json({
       status:         "active",
       testId:         test._id.toString(),
-      title:          test.title || "BPSC Free Practice Test",
+      title:          test.title || "Free Practice Test",
       totalQuestions: test.totalQuestions,
       date:           test.date,
+      phase:          test.phase,
       questions,
       note:                 "Persistent free practice test — available anytime until removed by admin",
       isPersistentFreeTest: true
@@ -1633,23 +1662,34 @@ app.get("/free/today-test", async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.post("/free/submit-test/:testId", async (req, res) => {
   try {
-    await connectDB();
-    const { answers, timeTakenSeconds } = req.body;
+    const conn = await connectPcsDB();
+    const Question = getQuestionModel(conn);
+
+    const { answers } = req.body;
     if (!Array.isArray(answers)) return res.status(400).json({ message: "answers must be array" });
-    const questions = await Question.find({ testId: req.params.testId });
+
+    const questions = await Question.find({ testId: req.params.testId }).lean();
     if (!questions.length) return res.status(404).json({ message: "Test not found" });
+
     let score = 0;
     questions.forEach(q => {
-      const ua = answers.find(a => a.questionId === q._id.toString());
-      if (ua && ua.selectedOption === q.correctOption) score++;
+      const ans = answers.find(a => a.questionId === q._id.toString());
+      const raw = ans && ans.selectedOption !== undefined && ans.selectedOption !== null
+        ? Number(ans.selectedOption)
+        : null;
+      const selected = raw === null || isNaN(raw) ? null : raw;
+      if (selected !== null && selected === q.correct_answer) score++;
     });
+
     const result = await FreeResult.create({
       testId: req.params.testId,
       score,
       totalQuestions: questions.length
     });
+
     const betterCount = await FreeResult.countDocuments({
       testId: req.params.testId,
       $or: [
@@ -1658,6 +1698,7 @@ app.post("/free/submit-test/:testId", async (req, res) => {
       ]
     });
     const total = await FreeResult.countDocuments({ testId: req.params.testId });
+
     res.json({
       score,
       total,
@@ -1670,6 +1711,7 @@ app.post("/free/submit-test/:testId", async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
 app.get("/free/leaderboard/:testId", async (req, res) => {
   try {
     await connectDB();
@@ -1692,6 +1734,11 @@ app.get("/free/leaderboard/:testId", async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// FREE PCS routes — unchanged, already correct (working per PYQ tab report)
+// ---------------------------------------------------------------------------
+
 app.get("/free-pcs/papers", async (req, res) => {
   try {
     const pcsConn = await connectPcsDB();
@@ -1895,6 +1942,11 @@ app.get("/free-pcs/attempt/:testId", userAuth, async (req, res) => {
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Ask Cron (Q&A) — unchanged
+// ---------------------------------------------------------------------------
+
 app.post("/qa/ask", userAuth, async (req, res) => {
   const question = (req.body?.question || "").trim();
   if (!question) return res.status(400).json({ message: "question is required" });
@@ -2076,6 +2128,11 @@ app.delete("/qa/history/:id", userAuth, async (req, res) => {
     res.status(500).json({ success: false, message: "Failed to delete history entry" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Selection probability analytics — unchanged
+// ---------------------------------------------------------------------------
+
 function mean(arr) {
   if (!arr.length) return 0;
   return arr.reduce((a, b) => a + b, 0) / arr.length;
@@ -2202,6 +2259,7 @@ app.get("/user/analytics/selection-probability", userAuth, async (req, res) => {
     res.status(500).json({ message: "Failed to calculate selection probability" });
   }
 });
+
 app.use((req, res) => {
   res.status(404).json({ success: false, message: "Route not found" });
 });
