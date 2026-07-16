@@ -571,22 +571,6 @@ async function buildTestResponse(test, userId, istNow) {
       message: "Test has not started yet"
     };
   }
-  if (istNow > deadlineIST) {
-    return {
-      status: "archived",
-      testId: test._id.toString(),
-      title: test.title,
-      startTimeIST: toISTISOString(test.startTime),
-      endTimeIST: toISTISOString(test.endTime),
-      deadlineIST: toISTISOString(new Date(deadlineIST.getTime() - IST_OFFSET_MS)),
-      totalQuestions: test.totalQuestions,
-      isSundayFullTest: !!test.isSundayFullTest,
-      hasSubmitted,
-      submittedPhases,
-      canReview: hasSubmitted,
-      message: "Test has ended and is now archived."
-    };
-  }
   const questions = await Question.find({ testId: test._id })
     .select("-correctOption")
     .sort({ questionNumber: 1 })
@@ -602,6 +586,8 @@ async function buildTestResponse(test, userId, istNow) {
     isSundayFullTest: !!test.isSundayFullTest,
     hasSubmitted,
     submittedPhases,
+    isPersistentPaidTest: true,
+    note: "This paid test paper remains available anytime until removed by admin",
   };
   if (test.isSundayFullTest) {
     const gs   = questions.filter(q => q.phase === "GS");
@@ -1067,6 +1053,36 @@ app.get("/user/today-tests", userAuth, async (req, res) => {
     res.json({ tests: responses, count: responses.length });
   } catch (err) {
     console.error("/user/today-tests error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+app.get("/user/paid-tests", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const tests = await Test.find({ testType: "paid" })
+      .sort({ date: -1, startTime: -1 })
+      .lean();
+    if (!tests.length) return res.status(404).json({ message: "No paid tests available" });
+    const istNow = nowIST();
+    const responses = await Promise.all(
+      tests.map(test => buildTestResponse(test, req.user.uid, istNow))
+    );
+    res.json({ tests: responses, count: responses.length });
+  } catch (err) {
+    console.error("/user/paid-tests error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+app.get("/user/paid-test/:testId", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const test = await Test.findOne({ _id: req.params.testId, testType: "paid" });
+    if (!test) return res.status(404).json({ message: "Paid test not found" });
+    const istNow = nowIST();
+    const response = await buildTestResponse(test, req.user.uid, istNow);
+    res.json(response);
+  } catch (err) {
+    console.error("/user/paid-test/:testId error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
