@@ -1574,11 +1574,25 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
 
 // FIXED: free Daily/GS/CSAT tests now also read from QUESTIONDB_URI with the
 // bilingual schema.
+//
+// IMPORTANT: Free PCS papers are ALSO stored as Test docs with testType:"free"
+// (see admin's /admin/create-free-pcs-test), but with phase:"free pcs" and
+// their questions in a separate DB (FREEPCS_URI, one dynamic collection per
+// paper). Every route below that lists/serves "free practice tests" (Daily/
+// GS/CSAT) MUST exclude phase:"free pcs", or it will (a) show Free PCS papers
+// in the Free Test tab, and (b) try to read their questions from the wrong
+// collection and return an empty question list. Free PCS has its own
+// dedicated routes further down (/free-pcs/*) — use those instead.
+const FREE_PRACTICE_QUERY = { testType: "free", phase: { $ne: "free pcs" } };
+
 app.get("/free/tests", async (req, res) => {
   try {
     const conn = await connectPcsDB();
     const Test = getPcsTestModel(conn);
-    const tests = await Test.find({ testType: "free" })
+    // Free PCS papers also have testType "free" but phase "free pcs" and their
+    // questions live in a completely different DB (FREEPCS_URI, per-paper
+    // collections) — they must never appear in the Daily/GS/CSAT free list.
+    const tests = await Test.find(FREE_PRACTICE_QUERY)
       .sort({ createdAt: -1 })
       .lean();
     if (!tests.length) return res.status(404).json({ message: "No free tests available" });
@@ -1607,7 +1621,7 @@ app.get("/free/test/:testId", async (req, res) => {
     const Test = getPcsTestModel(conn);
     const Question = getQuestionModel(conn);
 
-    const test = await Test.findOne({ _id: req.params.testId, testType: "free" }).lean();
+    const test = await Test.findOne({ _id: req.params.testId, ...FREE_PRACTICE_QUERY }).lean();
     if (!test) return res.status(404).json({ message: "Free test not found" });
 
     const questions = await Question.find({ testId: test._id })
@@ -1638,7 +1652,7 @@ app.get("/free/today-test", async (req, res) => {
     const Test = getPcsTestModel(conn);
     const Question = getQuestionModel(conn);
 
-    const test = await Test.findOne({ testType: "free" }).sort({ createdAt: -1 }).lean();
+    const test = await Test.findOne(FREE_PRACTICE_QUERY).sort({ createdAt: -1 }).lean();
     if (!test) return res.status(404).json({ message: "No free test available at the moment" });
 
     const questions = await Question.find({ testId: test._id })
@@ -1666,10 +1680,14 @@ app.get("/free/today-test", async (req, res) => {
 app.post("/free/submit-test/:testId", async (req, res) => {
   try {
     const conn = await connectPcsDB();
+    const Test = getPcsTestModel(conn);
     const Question = getQuestionModel(conn);
 
     const { answers } = req.body;
     if (!Array.isArray(answers)) return res.status(400).json({ message: "answers must be array" });
+
+    const test = await Test.findOne({ _id: req.params.testId, ...FREE_PRACTICE_QUERY }).lean();
+    if (!test) return res.status(404).json({ message: "Test not found" });
 
     const questions = await Question.find({ testId: req.params.testId }).lean();
     if (!questions.length) return res.status(404).json({ message: "Test not found" });
