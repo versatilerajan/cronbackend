@@ -413,6 +413,7 @@ const userSchema = new mongoose.Schema({
     to: Date,
   }],
   premiumExpiresAt: Date,
+  premiumAccessStartDate: { type: Date, default: null },
   isPremium: { type: Boolean, default: false },
   subscriptionId: { type: String, default: null },
   subscriptionStatus: { type: String, default: null },
@@ -424,6 +425,28 @@ const userSchema = new mongoose.Schema({
 }, { timestamps: true });
 const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
 const User   = mongoose.models.User   || mongoose.model("User",   userSchema);
+
+function isPremiumActive(user) {
+  return !!(user && user.isPremium && user.premiumExpiresAt && user.premiumExpiresAt.getTime() > Date.now());
+}
+async function refreshPremiumStatus(user) {
+  if (user && user.isPremium && (!user.premiumExpiresAt || user.premiumExpiresAt.getTime() <= Date.now())) {
+    user.isPremium = false;
+    await user.save();
+  }
+  return user;
+}
+function buildPaidTestFilter(user) {
+  const filter = { testType: "paid" };
+  if (user && user.premiumAccessStartDate) {
+    filter.createdAt = { $gte: user.premiumAccessStartDate };
+  }
+  return filter;
+}
+function isTestAccessibleToUser(user, test) {
+  if (!user || !user.premiumAccessStartDate || !test || !test.createdAt) return true;
+  return test.createdAt.getTime() >= user.premiumAccessStartDate.getTime();
+}
 
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) return res.status(503).json({ message: "Auth service unavailable" });
@@ -611,6 +634,7 @@ async function syncSubscription(uid) {
   const subscription = await razorpay.subscriptions.fetch(user.subscriptionId);
   user.subscriptionStatus = subscription.status;
   await user.save();
+  await refreshPremiumStatus(user);
   return {
     premium: user.isPremium,
     status: user.subscriptionStatus,
@@ -645,6 +669,7 @@ app.post("/user/profile", userAuth, async (req, res) => {
       },
       { upsert: true, new: true }
     );
+    await refreshPremiumStatus(user);
     res.json({
       success: true,
       displayName: user.displayName,
@@ -660,10 +685,11 @@ app.post("/user/profile", userAuth, async (req, res) => {
 app.get("/user/profile", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const user = await User.findOne({ uid: req.user.uid }).lean();
+    const user = await User.findOne({ uid: req.user.uid });
     if (!user) {
       return res.json({ success: true, displayName: "", email: "", isPremium: false });
     }
+    await refreshPremiumStatus(user);
     res.json({
       success: true,
       displayName: user.displayName || "",
@@ -771,6 +797,7 @@ app.get("/subscription/status", userAuth, async (req, res) => {
     if (!user) {
       return res.json({ success: true, premium: false });
     }
+    await refreshPremiumStatus(user);
     res.json({
       success: true,
       premium: user.isPremium,
@@ -837,6 +864,9 @@ app.post("/subscription/webhook", async (req, res) => {
     switch (event) {
       case "subscription.activated": {
         user.isPremium = true;
+        if (!user.premiumAccessStartDate) {
+          user.premiumAccessStartDate = new Date();
+        }
         if (subscription.current_start && subscription.current_end) {
           user.premiumPeriods.push({
             from: new Date(subscription.current_start * 1000),
@@ -863,15 +893,8 @@ app.post("/subscription/webhook", async (req, res) => {
       case "subscription.completed":
       case "subscription.cancelled":
       case "subscription.halted":
-        user.isPremium = false;
-        user.subscriptionId = null;
-        user.subscriptionStatus = null;
-        break;
       case "subscription.paused":
-        user.isPremium = false;
-        break;
       case "payment.failed":
-        user.isPremium = false;
         break;
       default:
         break;
@@ -1029,10 +1052,16 @@ app.get("/user/analytics/attempts", userAuth, async (req, res) => {
 app.get("/user/today-test", userAuth, async (req, res) => {
   try {
     await connectDB();
+    const user = await User.findOne({ uid: req.user.uid });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    await refreshPremiumStatus(user);
+    if (!user.isPremium) {
+      return res.status(403).json({ message: "Premium subscription required to access paid tests" });
+    }
     const conn = await connectPcsDB();
     const Test = getPcsTestModel(conn);
     const istNow = nowIST();
-    const test = await Test.findOne({ testType: "paid" }).sort({ startTime: -1 }).lean();
+    const test = await Test.findOne(buildPaidTestFilter(user)).sort({ startTime: -1 }).lean();
     if (!test) return res.status(404).json({ message: "No paid test available" });
     const response = await buildTestResponse(conn, test, req.user.uid, istNow);
     res.json(response);
@@ -1045,10 +1074,16 @@ app.get("/user/today-test", userAuth, async (req, res) => {
 app.get("/user/today-tests", userAuth, async (req, res) => {
   try {
     await connectDB();
+    const user = await User.findOne({ uid: req.user.uid });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    await refreshPremiumStatus(user);
+    if (!user.isPremium) {
+      return res.status(403).json({ message: "Premium subscription required to access paid tests" });
+    }
     const conn = await connectPcsDB();
     const Test = getPcsTestModel(conn);
     const istNow = nowIST();
-    const tests = await Test.find({ testType: "paid" })
+    const tests = await Test.find(buildPaidTestFilter(user))
       .sort({ startTime: -1 })
       .lean();
     if (!tests.length) return res.status(404).json({ message: "No paid tests available" });
@@ -1065,9 +1100,15 @@ app.get("/user/today-tests", userAuth, async (req, res) => {
 app.get("/user/paid-tests", userAuth, async (req, res) => {
   try {
     await connectDB();
+    const user = await User.findOne({ uid: req.user.uid });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    await refreshPremiumStatus(user);
+    if (!user.isPremium) {
+      return res.status(403).json({ message: "Premium subscription required to access paid tests" });
+    }
     const conn = await connectPcsDB();
     const Test = getPcsTestModel(conn);
-    const tests = await Test.find({ testType: "paid" })
+    const tests = await Test.find(buildPaidTestFilter(user))
       .sort({ startTime: -1 })
       .lean();
     if (!tests.length) return res.status(404).json({ message: "No paid tests available" });
@@ -1085,10 +1126,19 @@ app.get("/user/paid-tests", userAuth, async (req, res) => {
 app.get("/user/paid-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
+    const user = await User.findOne({ uid: req.user.uid });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    await refreshPremiumStatus(user);
+    if (!user.isPremium) {
+      return res.status(403).json({ message: "Premium subscription required to access paid tests" });
+    }
     const conn = await connectPcsDB();
     const Test = getPcsTestModel(conn);
     const test = await Test.findOne({ _id: req.params.testId, testType: "paid" }).lean();
     if (!test) return res.status(404).json({ message: "Paid test not found" });
+    if (!isTestAccessibleToUser(user, test)) {
+      return res.status(403).json({ message: "This test was published before your Premium subscription started" });
+    }
     const istNow = nowIST();
     const response = await buildTestResponse(conn, test, req.user.uid, istNow);
     res.json(response);
@@ -1288,6 +1338,12 @@ app.get("/leaderboard/global", userAuth, async (req, res) => {
 app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
+    const user = await User.findOne({ uid: req.user.uid });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    await refreshPremiumStatus(user);
+    if (!user.isPremium) {
+      return res.status(403).json({ message: "Premium subscription required to access paid tests" });
+    }
     const conn = await connectPcsDB();
     const Test = getPcsTestModel(conn);
     const Question = getQuestionModel(conn);
@@ -1300,6 +1356,9 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
     const test = await Test.findById(req.params.testId).lean();
     if (!test || test.testType !== "paid") {
       return res.status(404).json({ message: "Paid test not found" });
+    }
+    if (!isTestAccessibleToUser(user, test)) {
+      return res.status(403).json({ message: "This test was published before your Premium subscription started" });
     }
 
     const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
@@ -1997,7 +2056,7 @@ app.post("/qa/ask", userAuth, async (req, res) => {
         {
           uid: req.user.uid,
           $or: [
-            { isPremium: true },
+            { isPremium: true, premiumExpiresAt: { $gt: nowDate } },
             {
               $expr: {
                 $lt: [
@@ -2026,7 +2085,8 @@ app.post("/qa/ask", userAuth, async (req, res) => {
         });
       }
       user = reserved;
-      if (!user.isPremium) {
+      const activePremium = user.isPremium && user.premiumExpiresAt && user.premiumExpiresAt.getTime() > nowDate.getTime();
+      if (!activePremium) {
         reservedAt = nowDate;
         reservedForUid = req.user.uid;
       }
