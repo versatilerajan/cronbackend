@@ -215,7 +215,7 @@ async function connectDB() {
   }
   cached.conn = await cached.promise;
   await mongoose.model("Result").collection.createIndex(
-    { userId: 1, testId: 1, phase: 1, isLate: 1, score: -1, submittedAt: -1 },
+    { userId: 1, testId: 1, phase: 1, isLate: 1, score: -1, timeTakenSeconds: 1 },
     { background: true }
   );
   return cached.conn;
@@ -306,7 +306,6 @@ function getAIChatHistoryModel(conn) {
 
 const pcsTestSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true, maxlength: 200 },
-  date: { type: String, required: true },
   startTime: { type: Date },
   endTime: { type: Date },
   totalQuestions: { type: Number, default: 0 },
@@ -404,6 +403,7 @@ const resultSchema = new mongoose.Schema({
   answers: [{ questionId: String, selectedOption: String }],
   timeTakenSeconds: { type: Number, default: 0 }
 }, { timestamps: true });
+resultSchema.index({ userId: 1, testId: 1, phase: 1 }, { unique: true });
 const userSchema = new mongoose.Schema({
   uid: { type: String, required: true, unique: true },
   displayName: String,
@@ -531,14 +531,14 @@ function computeStreak(results, premiumPeriods, nowMs) {
   }
   return { currentStreak, longestStreak };
 }
-async function computeRank(testId, phase, score, submittedAt) {
+async function computeRank(testId, phase, score, timeTakenSeconds) {
   const better = await Result.countDocuments({
     testId,
     phase,
     isLate: false,
     $or: [
       { score: { $gt: score } },
-      { score: score, submittedAt: { $lt: submittedAt } }
+      { score: score, timeTakenSeconds: { $lt: timeTakenSeconds } }
     ]
   });
   const total = await Result.countDocuments({ testId, phase, isLate: false });
@@ -547,15 +547,6 @@ async function computeRank(testId, phase, score, submittedAt) {
 
 async function buildTestResponse(conn, test, userId, istNow) {
   const startIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
-  const endIST   = new Date(test.endTime.getTime()   + IST_OFFSET_MS);
-  const testDateParts = (test.date || "").split("-");
-  let deadlineIST = endIST;
-  if (testDateParts.length === 3) {
-    const [y, m, d] = testDateParts.map(Number);
-    const endOfDayUTC = new Date(Date.UTC(y, m - 1, d, 18, 29, 59));
-    const endOfDayIST = new Date(endOfDayUTC.getTime() + IST_OFFSET_MS);
-    deadlineIST = endOfDayIST > endIST ? endOfDayIST : endIST;
-  }
 
   const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
 
@@ -571,7 +562,7 @@ async function buildTestResponse(conn, test, userId, istNow) {
       title: test.title,
       startTimeIST: toISTISOString(test.startTime),
       endTimeIST: toISTISOString(test.endTime),
-      deadlineIST: toISTISOString(new Date(deadlineIST.getTime() - IST_OFFSET_MS)),
+      deadlineIST: toISTISOString(test.endTime),
       totalQuestions: test.totalQuestions,
       phase: test.phase,
       hasSubmitted: false,
@@ -592,7 +583,7 @@ async function buildTestResponse(conn, test, userId, istNow) {
     totalQuestions: test.totalQuestions,
     startTimeIST: toISTISOString(test.startTime),
     endTimeIST: toISTISOString(test.endTime),
-    deadlineIST: toISTISOString(new Date(deadlineIST.getTime() - IST_OFFSET_MS)),
+    deadlineIST: toISTISOString(test.endTime),
     phase: test.phase,
     questionPhase,
     hasSubmitted,
@@ -904,6 +895,8 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
     if (results.length === 0) {
       return res.json({
         testsGiven: 0,
+        paidTestsGiven: 0,
+        freeTestsGiven: 0,
         totalCorrect: 0,
         totalIncorrect: 0,
         totalUnattempted: 0,
@@ -921,6 +914,8 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
     let totalTime        = 0;
     let bestPct          = 0;
     let sumPct           = 0;
+    let paidTestsGiven    = 0;
+    let freeTestsGiven    = 0;
     const quizTypeStats = {
       paidDaily:  { count: 0, totalCorrect: 0, totalIncorrect: 0, totalMarks: 0, bestPercentage: 0, avgPercentage: 0, totalTimeSeconds: 0, minTimeSeconds: undefined, maxTimeSeconds: undefined },
       paidPhase1: { count: 0, totalCorrect: 0, totalIncorrect: 0, totalMarks: 0, bestPercentage: 0, avgPercentage: 0, totalTimeSeconds: 0, minTimeSeconds: undefined, maxTimeSeconds: undefined },
@@ -933,6 +928,8 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
       totalIncorrect    += r.incorrect    || 0;
       totalUnattempted  += r.unattempted  || 0;
       totalTime         += r.timeTakenSeconds || 0;
+      if (r.testType === 'free') freeTestsGiven++;
+      else paidTestsGiven++;
       const pct = r.totalQuestions > 0 ? (r.correct / r.totalQuestions) * 100 : 0;
       sumPct  += pct;
       bestPct  = Math.max(bestPct, pct);
@@ -968,6 +965,8 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
     const avgPercentage = testsGiven > 0 ? sumPct / testsGiven : 0;
     res.json({
       testsGiven,
+      paidTestsGiven,
+      freeTestsGiven,
       totalCorrect,
       totalIncorrect,
       totalUnattempted,
@@ -1032,10 +1031,9 @@ app.get("/user/today-test", userAuth, async (req, res) => {
     await connectDB();
     const conn = await connectPcsDB();
     const Test = getPcsTestModel(conn);
-    const istNow   = nowIST();
-    const todayIST = istNow.toISOString().split("T")[0];
-    const test = await Test.findOne({ date: todayIST, testType: "paid" }).lean();
-    if (!test) return res.status(404).json({ message: "No paid test available today" });
+    const istNow = nowIST();
+    const test = await Test.findOne({ testType: "paid" }).sort({ startTime: -1 }).lean();
+    if (!test) return res.status(404).json({ message: "No paid test available" });
     const response = await buildTestResponse(conn, test, req.user.uid, istNow);
     res.json(response);
   } catch (err) {
@@ -1049,12 +1047,11 @@ app.get("/user/today-tests", userAuth, async (req, res) => {
     await connectDB();
     const conn = await connectPcsDB();
     const Test = getPcsTestModel(conn);
-    const istNow   = nowIST();
-    const todayIST = istNow.toISOString().split("T")[0];
-    const tests = await Test.find({ date: todayIST, testType: "paid" })
-      .sort({ startTime: 1 })
+    const istNow = nowIST();
+    const tests = await Test.find({ testType: "paid" })
+      .sort({ startTime: -1 })
       .lean();
-    if (!tests.length) return res.status(404).json({ message: "No paid tests available today" });
+    if (!tests.length) return res.status(404).json({ message: "No paid tests available" });
     const responses = await Promise.all(
       tests.map(test => buildTestResponse(conn, test, req.user.uid, istNow))
     );
@@ -1071,7 +1068,7 @@ app.get("/user/paid-tests", userAuth, async (req, res) => {
     const conn = await connectPcsDB();
     const Test = getPcsTestModel(conn);
     const tests = await Test.find({ testType: "paid" })
-      .sort({ date: -1, startTime: -1 })
+      .sort({ startTime: -1 })
       .lean();
     if (!tests.length) return res.status(404).json({ message: "No paid tests available" });
     const istNow = nowIST();
@@ -1123,7 +1120,7 @@ app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
     };
 
     if (hasSubmitted) {
-      const { rank, totalParticipants } = await computeRank(test._id, questionPhase, result.score, result.submittedAt);
+      const { rank, totalParticipants } = await computeRank(test._id, questionPhase, result.score, result.timeTakenSeconds || 0);
       response.rankData = {
         score: Math.round(result.score * 100) / 100,
         correct: result.correct,
@@ -1307,21 +1304,13 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
 
     const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
 
-    const istNow  = nowIST();
-    const endIST  = new Date(test.endTime.getTime() + IST_OFFSET_MS);
-    const testDateParts = (test.date || "").split("-");
-    let deadlineIST = endIST;
-    if (testDateParts.length === 3) {
-      const [y, m, d] = testDateParts.map(Number);
-      const endOfDayUTC = new Date(Date.UTC(y, m - 1, d, 18, 29, 59));
-      const endOfDayIST = new Date(endOfDayUTC.getTime() + IST_OFFSET_MS);
-      deadlineIST = endOfDayIST > endIST ? endOfDayIST : endIST;
-    }
+    const istNow   = nowIST();
     const startIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
+    const endIST   = new Date(test.endTime.getTime() + IST_OFFSET_MS);
     if (istNow < startIST) {
       return res.status(403).json({ message: "Test has not started yet." });
     }
-    const isLate = istNow > deadlineIST;
+    const isLate = istNow > endIST;
     const now    = new Date();
 
     const existing = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: questionPhase });
@@ -1356,24 +1345,35 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
     });
 
     const score = calculateNetScore(correct, incorrect);
+    const finalTimeTaken = timeTakenSeconds || 0;
 
-    await Result.create({
-      userId: req.user.uid,
-      testId: test._id,
-      phase: questionPhase,
-      testType: "paid",
-      score,
-      correct,
-      incorrect,
-      unattempted,
-      attempted,
-      totalQuestions: questions.length,
-      submittedAt: now,
-      startedAt:   now,
-      isLate,
-      answers: savedAnswers,
-      timeTakenSeconds: timeTakenSeconds || 0
-    });
+    try {
+      await Result.create({
+        userId: req.user.uid,
+        testId: test._id,
+        phase: questionPhase,
+        testType: "paid",
+        score,
+        correct,
+        incorrect,
+        unattempted,
+        attempted,
+        totalQuestions: questions.length,
+        submittedAt: now,
+        startedAt:   now,
+        isLate,
+        answers: savedAnswers,
+        timeTakenSeconds: finalTimeTaken
+      });
+    } catch (createErr) {
+      if (createErr.code === 11000) {
+        return res.status(403).json({
+          message: "You have already submitted this test. You can only preview your attempt.",
+          alreadySubmitted: true
+        });
+      }
+      throw createErr;
+    }
 
     await User.findOneAndUpdate(
       { uid: req.user.uid },
@@ -1384,7 +1384,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       { upsert: true }
     );
 
-    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, score, now);
+    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, score, finalTimeTaken);
 
     res.json({
       phase:           questionPhase,
@@ -1421,7 +1421,7 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
       return res.status(404).json({ message: "No attempt found for this test" });
     }
 
-    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, result.score, result.submittedAt);
+    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, result.score, result.timeTakenSeconds || 0);
     res.json({
       rankRevealNow: true,
       phase: questionPhase,
@@ -1449,20 +1449,22 @@ app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
 
     const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
     const results = await Result.find({ testId: test._id, phase: questionPhase, isLate: false })
-      .sort({ score: -1, submittedAt: 1 })
+      .sort({ score: -1, timeTakenSeconds: 1 })
       .limit(50)
       .lean();
     const total = await Result.countDocuments({ testId: test._id, phase: questionPhase, isLate: false });
 
     res.json({
       phase: questionPhase,
-      leaderboard: results.map(r => ({
+      leaderboard: results.map((r, idx) => ({
+        rank: idx + 1,
         userId: r.userId,
         score:  Math.round(r.score * 100) / 100,
+        timeTakenSeconds: r.timeTakenSeconds || 0,
         submittedAt: r.submittedAt
       })),
       totalRankedParticipants: total,
-      note: "On-time attempts"
+      note: "On-time attempts, ranked by score then time taken"
     });
   } catch (err) {
     console.error("/user/leaderboard error:", err.message);
@@ -1505,7 +1507,7 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
       };
     });
 
-    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, result.score, result.submittedAt);
+    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, result.score, result.timeTakenSeconds || 0);
 
     res.json({
       title:       test.title,
@@ -1544,7 +1546,6 @@ app.get("/free/tests", async (req, res) => {
       tests: tests.map(t => ({
         testId:         t._id.toString(),
         title:          t.title || "Free Practice Test",
-        date:           t.date  || "—",
         totalQuestions: t.totalQuestions,
         phase:          t.phase,
         createdAt:      t.createdAt ? new Date(t.createdAt).toISOString() : null,
@@ -1577,7 +1578,6 @@ app.get("/free/test/:testId", async (req, res) => {
       testId:         test._id.toString(),
       title:          test.title || "Free Practice Test",
       totalQuestions: test.totalQuestions,
-      date:           test.date,
       phase:          test.phase,
       questions,
       note:                 "Persistent free practice test — available anytime until removed by admin",
@@ -1608,7 +1608,6 @@ app.get("/free/today-test", async (req, res) => {
       testId:         test._id.toString(),
       title:          test.title || "Free Practice Test",
       totalQuestions: test.totalQuestions,
-      date:           test.date,
       phase:          test.phase,
       questions,
       note:                 "Persistent free practice test — available anytime until removed by admin",
@@ -1671,24 +1670,35 @@ app.post("/free/submit-test/:testId", userAuth, async (req, res) => {
 
     const score = calculateNetScore(correct, incorrect);
     const now = new Date();
+    const finalTimeTaken = timeTakenSeconds || 0;
 
-    await Result.create({
-      userId: req.user.uid,
-      testId: test._id,
-      phase: questionPhase,
-      testType: "free",
-      score,
-      correct,
-      incorrect,
-      unattempted,
-      attempted,
-      totalQuestions: questions.length,
-      submittedAt: now,
-      startedAt: now,
-      isLate: false,
-      answers: savedAnswers,
-      timeTakenSeconds: timeTakenSeconds || 0
-    });
+    try {
+      await Result.create({
+        userId: req.user.uid,
+        testId: test._id,
+        phase: questionPhase,
+        testType: "free",
+        score,
+        correct,
+        incorrect,
+        unattempted,
+        attempted,
+        totalQuestions: questions.length,
+        submittedAt: now,
+        startedAt: now,
+        isLate: false,
+        answers: savedAnswers,
+        timeTakenSeconds: finalTimeTaken
+      });
+    } catch (createErr) {
+      if (createErr.code === 11000) {
+        return res.status(403).json({
+          message: "You have already submitted this test. You can only preview your attempt.",
+          alreadySubmitted: true
+        });
+      }
+      throw createErr;
+    }
 
     await User.findOneAndUpdate(
       { uid: req.user.uid },
@@ -1699,7 +1709,7 @@ app.post("/free/submit-test/:testId", userAuth, async (req, res) => {
       { upsert: true }
     );
 
-    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, score, now);
+    const { rank, totalParticipants } = await computeRank(test._id, questionPhase, score, finalTimeTaken);
 
     res.json({
       phase:           questionPhase,
@@ -1729,7 +1739,7 @@ app.get("/free/leaderboard/:testId", async (req, res) => {
 
     const questionPhase = test.phase === "csat" ? "CSAT" : "GS";
     const results = await Result.find({ testId: test._id, phase: questionPhase, testType: "free", isLate: false })
-      .sort({ score: -1, submittedAt: 1 })
+      .sort({ score: -1, timeTakenSeconds: 1 })
       .limit(100)
       .lean();
     const total = await Result.countDocuments({ testId: test._id, phase: questionPhase, testType: "free", isLate: false });
@@ -1743,6 +1753,7 @@ app.get("/free/leaderboard/:testId", async (req, res) => {
         correct:        r.correct,
         incorrect:      r.incorrect,
         totalQuestions: r.totalQuestions,
+        timeTakenSeconds: r.timeTakenSeconds || 0,
         submittedAt:    r.submittedAt
       })),
       totalParticipants: total
@@ -1779,7 +1790,6 @@ app.get("/free-pcs/papers", async (req, res) => {
       return {
         testId:         t._id.toString(),
         title:          t.title,
-        date:           t.date,
         totalQuestions: t.totalQuestions,
         examType,
         year,
@@ -1811,7 +1821,6 @@ app.get("/free-pcs/paper/:testId", async (req, res) => {
       success: true,
       testId:         test._id.toString(),
       title:          test.title,
-      date:           test.date,
       totalQuestions: test.totalQuestions,
       examType:       questions[0]?.examType || null,
       year:           questions[0]?.year || null,
@@ -1872,23 +1881,30 @@ app.post("/free-pcs/submit-test/:testId", userAuth, async (req, res) => {
       };
     });
     const score = calculateNetScore(correct, incorrect);
-    await Result.create({
-      userId: req.user.uid,
-      testId: test._id,
-      phase: "free pcs",
-      testType: "free",
-      score,
-      correct,
-      incorrect,
-      unattempted,
-      attempted,
-      totalQuestions: questions.length,
-      submittedAt: new Date(),
-      startedAt: new Date(),
-      isLate: false,
-      answers: savedAnswers,
-      timeTakenSeconds: timeTakenSeconds || 0,
-    });
+    try {
+      await Result.create({
+        userId: req.user.uid,
+        testId: test._id,
+        phase: "free pcs",
+        testType: "free",
+        score,
+        correct,
+        incorrect,
+        unattempted,
+        attempted,
+        totalQuestions: questions.length,
+        submittedAt: new Date(),
+        startedAt: new Date(),
+        isLate: false,
+        answers: savedAnswers,
+        timeTakenSeconds: timeTakenSeconds || 0,
+      });
+    } catch (createErr) {
+      if (createErr.code === 11000) {
+        return res.status(403).json({ success: false, message: "You have already submitted this paper", alreadySubmitted: true });
+      }
+      throw createErr;
+    }
     await User.findOneAndUpdate(
       { uid: req.user.uid },
       {
