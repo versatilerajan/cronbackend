@@ -1247,88 +1247,60 @@ app.get("/leaderboard/global", userAuth, async (req, res) => {
   try {
     await connectDB();
     const uid = req.user.uid;
-    const othersLimit = Math.max(1, Math.min(parseInt(req.query.limit) || 9, 100));
-    const topOthers = await Result.aggregate([
-      { $match: { isLate: false, userId: { $ne: uid } } },
-      {
-        $group: {
-          _id: "$userId",
-          totalMarks: {
-            $sum: { $subtract: [{ $multiply: ["$correct", 2] }, { $multiply: ["$incorrect", 0.66] }] }
-          },
-          totalCorrect: { $sum: "$correct" },
-          testsGiven: { $sum: 1 }
-        }
-      },
-      { $sort: { totalMarks: -1 } },
-      { $limit: othersLimit }
-    ]);
-    const myAgg = await Result.aggregate([
-      { $match: { isLate: false, userId: uid } },
-      {
-        $group: {
-          _id: "$userId",
-          totalMarks: {
-            $sum: { $subtract: [{ $multiply: ["$correct", 2] }, { $multiply: ["$incorrect", 0.66] }] }
-          },
-          totalCorrect: { $sum: "$correct" },
-          testsGiven: { $sum: 1 }
-        }
-      }
-    ]);
-    const myStats = myAgg[0] || { totalMarks: 0, totalCorrect: 0, testsGiven: 0 };
-    const betterUsers = await Result.aggregate([
+    const WINDOW_SIZE = 10;
+
+    const allAgg = await Result.aggregate([
       { $match: { isLate: false } },
       {
         $group: {
           _id: "$userId",
           totalMarks: {
             $sum: { $subtract: [{ $multiply: ["$correct", 2] }, { $multiply: ["$incorrect", 0.66] }] }
-          }
+          },
+          totalCorrect: { $sum: "$correct" },
+          testsGiven: { $sum: 1 }
         }
       },
-      { $match: { totalMarks: { $gt: myStats.totalMarks } } },
-      { $count: "count" }
+      { $sort: { totalMarks: -1, _id: 1 } }
     ]);
-    const myRank = (betterUsers[0]?.count || 0) + 1;
-    const totalParticipants = await Result.distinct("userId", { isLate: false })
-      .then(ids => new Set(ids).size);
-    const combinedRaw = [
-      ...topOthers.map((entry, i) => ({
+
+    const totalParticipants = allAgg.length;
+    const myIndex = allAgg.findIndex(e => e._id === uid);
+
+    if (myIndex === -1) {
+      return res.json({
+        leaderboard: [],
+        totalParticipants,
+        yourRank: null,
+        message: "Complete at least one paid test to appear on the leaderboard."
+      });
+    }
+
+    const myRank = myIndex + 1;
+
+    let startIdx = Math.max(0, myIndex - Math.floor((WINDOW_SIZE - 1) / 2));
+    let endIdx = Math.min(totalParticipants, startIdx + WINDOW_SIZE);
+    startIdx = Math.max(0, endIdx - WINDOW_SIZE);
+
+    const windowEntries = allAgg.slice(startIdx, endIdx);
+    const uids = windowEntries.map(e => e._id);
+    const profiles = await User.find({ uid: { $in: uids } }, { uid: 1, displayName: 1 }).lean();
+    const profileMap = new Map(profiles.map(p => [p.uid, p]));
+
+    const finalLeaderboard = windowEntries.map((entry, i) => {
+      const profile = profileMap.get(entry._id);
+      return {
+        rank: startIdx + i + 1,        
         userId: entry._id,
+        name: profile?.displayName || "Anonymous",
         totalMarks: Math.round(entry.totalMarks * 100) / 100,
         totalCorrect: entry.totalCorrect,
         testsGiven: entry.testsGiven,
-        rank: i + 1
-      })),
-      {
-        userId: uid,
-        totalMarks: Math.round(myStats.totalMarks * 100) / 100,
-        totalCorrect: myStats.totalCorrect,
-        testsGiven: myStats.testsGiven,
-        rank: myRank
-      }
-    ];
-    combinedRaw.sort((a, b) => a.rank - b.rank);
-    const uids = combinedRaw.map(e => e.userId);
-    const profiles = await User.find({ uid: { $in: uids } }, { uid: 1, displayName: 1 }).lean();
-    const profileMap = new Map(profiles.map(p => [p.uid, p]));
-    const finalLeaderboard = combinedRaw.map(entry => {
-      const profile = profileMap.get(entry.userId);
-      return {
-        rank: entry.rank,
-        name: profile?.displayName || "Anonymous",
-        totalMarks: entry.totalMarks,
-        totalCorrect: entry.totalCorrect,
-        testsGiven: entry.testsGiven,
-        isCurrentUser: entry.userId === uid
+        isCurrentUser: entry._id === uid
       };
     });
-    res.json({
-      leaderboard: finalLeaderboard,
-      totalParticipants,
-      yourRank: myRank
-    });
+
+    res.json({ leaderboard: finalLeaderboard, totalParticipants, yourRank: myRank });
   } catch (err) {
     console.error("/leaderboard/global error:", err.message);
     res.status(500).json({ message: "Failed to fetch global leaderboard" });
