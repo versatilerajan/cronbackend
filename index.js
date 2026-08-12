@@ -436,16 +436,25 @@ async function refreshPremiumStatus(user) {
   }
   return user;
 }
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+function startOfISTDayUTC(date) {
+  const ist = new Date(date.getTime() + IST_OFFSET_MS);
+  const y = ist.getUTCFullYear();
+  const m = ist.getUTCMonth();
+  const d = ist.getUTCDate();
+  const istMidnightMs = Date.UTC(y, m, d, 0, 0, 0, 0);
+  return new Date(istMidnightMs - IST_OFFSET_MS);
+}
 function buildPaidTestFilter(user) {
   const filter = { testType: "paid" };
   if (user && user.premiumAccessStartDate) {
-    filter.createdAt = { $gte: user.premiumAccessStartDate };
+    filter.createdAt = { $gte: startOfISTDayUTC(user.premiumAccessStartDate) };
   }
   return filter;
 }
 function isTestAccessibleToUser(user, test) {
   if (!user || !user.premiumAccessStartDate || !test || !test.createdAt) return true;
-  return test.createdAt.getTime() >= user.premiumAccessStartDate.getTime();
+  return test.createdAt.getTime() >= startOfISTDayUTC(user.premiumAccessStartDate).getTime();
 }
 
 const userAuth = async (req, res, next) => {
@@ -464,7 +473,6 @@ const userAuth = async (req, res, next) => {
 function calculateNetScore(correct, incorrect) {
   return (correct * 2) - (incorrect * 0.66);
 }
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 function nowIST() {
   return new Date(Date.now() + IST_OFFSET_MS);
 }
