@@ -100,7 +100,7 @@ async function searchKnowledgeBase(vector, topK) {
   });
   return result.points || [];
 }
-async function searchQuestionBank(vector, topK) {
+async function searchQuestionBank(vector,topK) {
   const result = await qdrant.query(QDRANT_QUESTION_BANK_COLLECTION, {
     query: vector,
     limit: topK,
