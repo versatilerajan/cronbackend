@@ -1,11 +1,19 @@
 {
-  "name": "UPSC Cron Backend",
+  "name": "upsc-cron-backend",
   "version": "1.332.901",
   "description": "Backend to handle user operations",
-  "main": "index.js",
-  "engines": {
-    "node": ">=20.19.0"
+  "homepage": "https://github.com/versatilerajan/cronbackend#readme",
+  "bugs": {
+    "url": "https://github.com/versatilerajan/cronbackend/issues"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/versatilerajan/cronbackend.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
@@ -22,9 +30,11 @@
     "firebase-admin": "^13.6.1",
     "helmet": "^8.1.0",
     "razorpay": "^2.9.6"
-
   },
   "devDependencies": {
     "nodemon": "^3.1.9"
+  },
+  "engines": {
+    "node": ">=20.19.0"
   }
 }
