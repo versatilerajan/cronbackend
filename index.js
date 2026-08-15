@@ -72,6 +72,9 @@ const QA_QUESTION_BANK_TOP_K = parseInt(process.env.QA_QUESTION_BANK_TOP_K || "5
 const FREE_DAILY_QUERY_LIMIT = parseInt(process.env.FREE_DAILY_QUERY_LIMIT || "1", 10);
 const ENABLE_QUERY_DAILY_LIMIT = process.env.ENABLE_QUERY_DAILY_LIMIT !== "false";
 const QA_USAGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+// Shared secret the admin backend must send when it calls /internal/notify-new-test.
+// Generate a long random string and set the SAME value in both backends' env vars.
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const qdrant = new QdrantClient({ url: QDRANT_URL, apiKey: QDRANT_API_KEY });
 let embedderPromise = null;
 function getEmbedder() {
@@ -422,6 +425,9 @@ const userSchema = new mongoose.Schema({
   qaUsage: {
     askTimestamps: { type: [Date], default: [] },
   },
+  // FCM registration tokens for this user's devices. A user can have several
+  // (phone + tablet, or a reinstalled app), so we keep an array and dedupe on write.
+  fcmTokens: { type: [String], default: [] },
 }, { timestamps: true });
 const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
 const User   = mongoose.models.User   || mongoose.model("User",   userSchema);
@@ -635,6 +641,21 @@ function verifyWebhookSignature(rawBody, signature) {
     Buffer.from(signature)
   );
 }
+
+// Compares the x-internal-key header against INTERNAL_API_KEY using a
+// constant-time comparison, the same pattern used for the Razorpay webhook.
+// This is the gate that keeps /internal/notify-new-test from being called
+// by anyone other than the admin backend.
+function verifyInternalKey(req) {
+  if (!INTERNAL_API_KEY) return false;
+  const provided = req.headers["x-internal-key"];
+  if (!provided) return false;
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(INTERNAL_API_KEY));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
 async function syncSubscription(uid) {
   const user = await User.findOne({ uid });
   if (!user) throw new Error("User not found");
@@ -707,6 +728,44 @@ app.get("/user/profile", userAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("/user/profile GET error:", err.message);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Registers (or refreshes) an FCM device token for the signed-in user.
+// Call this after login and whenever FirebaseMessaging.onTokenRefresh fires.
+app.post("/user/fcm-token", userAuth, async (req, res) => {
+  try {
+    const token = (req.body?.token || "").trim();
+    if (!token) return res.status(400).json({ success: false, message: "token is required" });
+    await connectDB();
+    await User.findOneAndUpdate(
+      { uid: req.user.uid },
+      {
+        $setOnInsert: { uid: req.user.uid },
+        $set: { displayName: req.user.name || "", email: req.user.email || "" },
+        $addToSet: { fcmTokens: token },
+      },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("/user/fcm-token error:", err.message);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Removes a device token, e.g. on sign-out, so a logged-out device stops
+// receiving pushes for this account.
+app.post("/user/fcm-token/remove", userAuth, async (req, res) => {
+  try {
+    const token = (req.body?.token || "").trim();
+    if (!token) return res.status(400).json({ success: false, message: "token is required" });
+    await connectDB();
+    await User.updateOne({ uid: req.user.uid }, { $pull: { fcmTokens: token } });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("/user/fcm-token/remove error:", err.message);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
@@ -2319,6 +2378,127 @@ app.get("/user/analytics/selection-probability", userAuth, async (req, res) => {
   } catch (err) {
     console.error("/user/analytics/selection-probability error:", err.message);
     res.status(500).json({ message: "Failed to calculate selection probability" });
+  }
+});
+
+// Called by the admin backend right after a paid test is created.
+// Sends an FCM push to every currently-premium user's registered devices.
+// Protected by a shared secret (x-internal-key) instead of userAuth since
+// the caller is a server, not a signed-in user.
+app.post("/internal/notify-new-test", async (req, res) => {
+  try {
+    if (!verifyInternalKey(req)) {
+      return res.status(401).json({ success: false, message: "Invalid internal key" });
+    }
+    if (!firebaseInitialized) {
+      return res.status(503).json({ success: false, message: "Firebase not initialized" });
+    }
+    await connectDB();
+    const { title, testId, totalQuestions, phase, testType } = req.body || {};
+    if (!title || !testId) {
+      return res.status(400).json({ success: false, message: "title and testId are required" });
+    }
+
+    const nowDate = new Date();
+    const premiumUsers = await User.find(
+      {
+        isPremium: true,
+        premiumExpiresAt: { $gt: nowDate },
+        fcmTokens: { $exists: true, $not: { $size: 0 } },
+      },
+      { uid: 1, fcmTokens: 1 }
+    ).lean();
+
+    if (premiumUsers.length === 0) {
+      return res.json({ success: true, notified: 0, message: "No premium users with registered devices" });
+    }
+
+    const tokens = [];
+    const tokenOwners = [];
+    premiumUsers.forEach(u => {
+      (u.fcmTokens || []).forEach(t => {
+        tokens.push(t);
+        tokenOwners.push(u.uid);
+      });
+    });
+
+    const notification = {
+      title: String(title),
+      body: totalQuestions
+        ? `${totalQuestions} questions • New paid test is live now`
+        : "A new paid test is live now",
+    };
+    // "screen" is read by the Flutter NotificationService to decide where a
+    // tapped notification should navigate (Paid Tests screen).
+    const data = {
+      type: "new_test",
+      screen: "paid_tests",
+      testId: String(testId),
+      testType: String(testType || "paid"),
+      phase: String(phase || ""),
+    };
+
+    const BATCH_SIZE = 500; // FCM's multicast limit per call
+    let successCount = 0;
+    let failureCount = 0;
+    const staleTokensByUid = new Map();
+
+    for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
+      const batchTokens = tokens.slice(i, i + BATCH_SIZE);
+      const batchOwners = tokenOwners.slice(i, i + BATCH_SIZE);
+      let response;
+      try {
+        response = await admin.messaging().sendEachForMulticast({
+          tokens: batchTokens,
+          notification,
+          data,
+        });
+      } catch (batchErr) {
+        console.error("[notify-new-test] batch send failed:", batchErr.message);
+        continue;
+      }
+      successCount += response.successCount;
+      failureCount += response.failureCount;
+      response.responses.forEach((r, idx) => {
+        if (!r.success) {
+          const code = r.error?.code || "";
+          if (
+            code === "messaging/registration-token-not-registered" ||
+            code === "messaging/invalid-registration-token"
+          ) {
+            const uid = batchOwners[idx];
+            const tok = batchTokens[idx];
+            if (!staleTokensByUid.has(uid)) staleTokensByUid.set(uid, []);
+            staleTokensByUid.get(uid).push(tok);
+          }
+        }
+      });
+    }
+
+    if (staleTokensByUid.size > 0) {
+      const bulkOps = [...staleTokensByUid.entries()].map(([uid, staleTokens]) => ({
+        updateOne: {
+          filter: { uid },
+          update: { $pull: { fcmTokens: { $in: staleTokens } } },
+        },
+      }));
+      try {
+        await User.bulkWrite(bulkOps);
+      } catch (cleanupErr) {
+        console.error("[notify-new-test] stale token cleanup failed:", cleanupErr.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      notified: successCount,
+      failed: failureCount,
+      totalTokens: tokens.length,
+      premiumUsersTargeted: premiumUsers.length,
+    });
+  } catch (err) {
+    console.error("/internal/notify-new-test error:", err.message);
+    res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
